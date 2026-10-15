@@ -18,10 +18,10 @@ from storage import Store
 
 load_dotenv()
 BASE = Path(__file__).parent
-CONTROL_TOKEN = os.getenv("CONTROL_BOT_TOKEN", "")
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-TARGET_CHAT = os.getenv("TARGET_CHAT", "")
+CONTROL_TOKEN = os.getenv("7838301513:AAENbMTS_M1RuEQk1v3d1ZimjNn0SwDuogQ", "")
+API_ID = int(os.getenv("TELEGRAM_API_ID", "26928420"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "0facea2bb49930df0718fb74cda1790d")
+TARGET_CHAT = os.getenv("TARGET_CHAT", "@DialoguesAi")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 DELAY = max(10, int(os.getenv("TURN_DELAY_SECONDS", "25")))
 MAX_TURNS = max(1, int(os.getenv("MAX_TURNS_PER_RUN", "20")))
