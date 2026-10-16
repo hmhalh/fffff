@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetHistoryRequest
-from telethon.tl.functions.channels import ReadHistoryRequest
+from telethon.tl.functions.channels import ReadHistoryRequest, JoinChannelRequest
 from google import genai
 from telegram import (
     Update,
@@ -136,8 +136,8 @@ def create_character(name):
     actual_name = path.stem
     character = {
         "name": actual_name,
-        "personality": "شخص طبيعي جداً، يحب السوالف والعكسات والضحك، يعلق على الكلام بعفوية وبلهجة عراقية دارجة.",
-        "speaking_style": "عراقي عامي طبيعي، عبارات قصيرة، يضحك، يسولف، ويعلق مثل البشر بالجروبات.",
+        "personality": "شخص طبيعي، يحب السوالف والضحك والعكسات، يتكلم باللهجة العراقية الطبيعية.",
+        "speaking_style": "عراقي عامي، عبارات عفوية، يضحك ويسولف مثل باقي الأعضاء.",
         "mood": "مرتاح وطبيعي",
         "background": "",
         "messages": [],
@@ -163,11 +163,10 @@ def add_message(character, role, text):
 
 
 # ==================================================
-# الذكاء الاصطناعي (Gemini - سوالف بشرية عفوية)
+# الذكاء الاصطناعي (Gemini)
 # ==================================================
 
 async def generate_human_chat(character, user_text, sender_name="صديق"):
-    """توليد رد عراقي بشري طبيعي جداً (تعليق، ضحكة، سالفة، موافقة أو اعتراض)"""
     api_key = settings.get("gemini_api_key", "")
     if not api_key:
         return None
@@ -186,10 +185,10 @@ async def generate_human_chat(character, user_text, sender_name="صديق"):
 شخصيتك: {character.get('personality', '')}
 أسلوب كلامك: {character.get('speaking_style', '')}
 
-تعليمات السوالف البشرية:
-1. اتكلم باللهجة العراقية العامة اليومية العفوية 100% (استخدم كلمات مثل: هلو، هههه، والله، صدك، خطية، لك، يمعود، تمام، الخ).
-2. لا تجاوب أسلوب "سؤال وجواب" رسمي، بل علّق على كلام الشخص، اضحك، أيد كلامه، اختلف وياه، أو احكي موقف أو سالفة بسيطة تج طليعية.
-3. الرد خليه قصير وطبيعي مثل رسائل التليغرام البشرية (من كلمة إلى جملة أو جملتين قصيرة).
+قواعد السوالف البشرية:
+1. اتكلم باللهجة العراقية العامة اليومية العفوية 100% (استخدم كلمات مثل: هلو، هههه، والله، صدك، يمعود، تمام، الخ).
+2. لا تجاوب أسلوب "سؤال وجواب" رسمي، بل علّق على كلام الشخص، اضحك، أيد كلامه، أو احكي سالفة بسيطة.
+3. الرد خليه قصير وطبيعي مثل رسائل التليغرام البشرية.
 4. لا تقول أبداً إنك بوت أو ذكاء اصطناعي.
 
 سجل المحادثة بالجروب:
@@ -216,18 +215,17 @@ async def generate_human_chat(character, user_text, sender_name="صديق"):
 
 
 async def generate_spontaneous_topic(character):
-    """توليد سالفة أو تعليق عفوي مفاجئ في الجروب لتنشيط السوالف"""
     api_key = settings.get("gemini_api_key", "")
     if not api_key:
         return None
 
     client = genai.Client(api_key=api_key)
     prompt = f"""
-أنت شخصية حقيقية كاعد بالجروب وتصرف مثل البشر.
+أنت شخصية حقيقية بالجروب وتصرف مثل البشر.
 اسمك: {character.get('name', 'شخصية')}
 أسلوبك: {character.get('speaking_style', '')}
 
-اكتب سالفة قصيرة أو كلمة عفوية باللهجة العراقية تفتح بيها مجال للسوالف بالجروب (مثل: هلا بيهم، شكو ماكو اليوم؟، ضوجة مو؟، شسوون؟، أو تعليق عراقي بسيط).
+اكتب سالفة قصيرة أو كلمة عفوية باللهجة العراقية تفتح بيها مجال للسوالف بالجروب (مثلاً: هلا بيهم، شكو ماكو اليوم؟، ضوجة مو؟، شسوون؟).
 النص فقط:
 """
 
@@ -289,8 +287,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.effective_message.reply_text(
-        "🤖 لوحة إدارة تفاعل الشخصيات الحقيقية والسوالف\n\n"
-        "الحسابات تتصرف وتتكلم باللهجة العراقية العفوية كأشخاص حقيقيين.",
+        "🤖 لوحة إدارة الحسابات والسوالف البشرية\n\n"
+        "ملاحظة مهمة: أضف رابط الجروب (مثل https://t.me/... أو @username) في قائمة المجموعات لتقوم الحسابات بالانضمام تلقائياً.",
         reply_markup=main_keyboard(),
     )
 
@@ -358,12 +356,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➖ حذف مجموعة", callback_data="remove_group")],
             [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
         ])
-        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}\n\n(أرسل المعرّف أو رابط الدعوة هنا)", keyboard)
+        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}\n\n⚠️ يُفضل إضافة رابط الدعوة الخاص بالجروب (مثل https://t.me/+xxx أو @username)", keyboard)
         return
 
     if action == "add_group":
         pending[user.id] = {"action": "add_group"}
-        await show_page(query, "➕ أرسل معرّف المجموعة أو رابط الدعوة:", back_keyboard("groups"))
+        await show_page(query, "➕ أرسل رابط الجروب (مثل https://t.me/joinchat/... أو @groupname):", back_keyboard("groups"))
         return
 
     if action == "remove_group":
@@ -391,7 +389,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• الشخصيات: {len(files)}\n"
             f"• الحسابات: {len(sessions)}\n"
             f"• المجموعات: {len(settings['groups'])}\n"
-            f"• السوالف والتفاعل: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}"
+            f"• حالة التفاعل: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}"
         )
         await show_page(query, text, back_keyboard())
         return
@@ -417,7 +415,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_settings()
         await show_page(
             query,
-            f"حالة الردود والسوالف أصبحت: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}",
+            f"حالة الردود أصبحت: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}",
             main_keyboard(),
         )
 
@@ -468,11 +466,41 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==================================================
-# محاكاة سلوك قراءة ومراقبة الشاشة
+# محاكاة الانضمام وقراءة الرسائل
 # ==================================================
 
+async def join_group_if_needed(client, group_input):
+    """الانضمام التلقائي الذكي للجروب مهما كان نوع الرابط أو المعرف"""
+    try:
+        # إذا كان رابط دعوة خاص (+ أو joinchat)
+        if "+" in group_input or "joinchat" in group_input:
+            hash_code = group_input.split("/")[-1].replace("+", "").split("?")[0]
+            try:
+                await client(ImportChatInviteRequest(hash_code))
+                log.info(f"تم الانضمام للجروب الخاص بنجاح: {group_input}")
+            except Exception as e:
+                log.info(f"الحساب منضم مسبقاً أو يتعذر الانضمام: {e}")
+            return await client.get_entity(group_input)
+        
+        # إذا كان معرف عام (@group) أو معرف رقمي
+        target = int(group_input) if group_input.lstrip("-").isdigit() else group_input
+        try:
+            entity = await client.get_entity(target)
+            try:
+                await client(JoinChannelRequest(entity))
+                log.info(f"تم الانضمام للجروب العام بنجاح.")
+            except Exception:
+                pass
+            return entity
+        except Exception as e:
+            log.error(f"تعذر العثور على الجروب {group_input}: {e}")
+            return None
+    except Exception as e:
+        log.error(f"فشل في الانضمام إلى {group_input}: {e}")
+        return None
+
+
 async def simulate_human_reading(client, entity):
-    """محاكاة قراءة ومتابعة الرسائل كإنسان حقيقي"""
     try:
         await client(ReadHistoryRequest(peer=entity))
         await client(GetHistoryRequest(
@@ -480,7 +508,7 @@ async def simulate_human_reading(client, entity):
         ))
         await asyncio.sleep(2)
     except Exception as e:
-        log.error(f"خطأ أثناء قراءة الشاشة: {e}")
+        log.error(f"خطأ أثناء قراءة الرسائل: {e}")
 
 
 async def start_client_session(session_path):
@@ -510,7 +538,6 @@ async def start_client_session(session_path):
         if event.sender_id == me.id:
             return
 
-        # مشاهدة وقراءة الرسائل أولاً كإنسان
         await simulate_human_reading(client, chat)
 
         char_name = me.first_name or "شخصية"
@@ -529,7 +556,7 @@ async def start_client_session(session_path):
 
         try:
             async with client.action(chat, 'typing'):
-                await asyncio.sleep(2.5)  # محاكاة الكتابة العفوية
+                await asyncio.sleep(3)  # محاكاة كتابة حقيقية
                 reply_text = await generate_human_chat(character, message_text, sender_name)
         except Exception:
             log.exception("خطأ في توليد السالفة")
@@ -545,10 +572,10 @@ async def start_client_session(session_path):
         log.error(f"الجلسة {session_path.name} غير مفعّلة.")
         return None
 
-    # مهمة المبادرة بالسوالف والمواضيع بالجروب
+    # حلقة الانضمام والمراسلة التلقائية
     async def spontaneous_chat_task():
         while True:
-            await asyncio.sleep(240)  # كل 4 دقائق سالفة أو تعليق جديد
+            await asyncio.sleep(60)  # الفحص والانضمام كل دقيقة
             if not settings.get("running"):
                 continue
 
@@ -564,20 +591,13 @@ async def start_client_session(session_path):
 
             for g_item in registered_groups:
                 try:
-                    entity = None
-                    if "t.me/+" in g_item or "t.me/joinchat/" in g_item or "joinchat" in g_item:
-                        hash_code = g_item.split("/")[-1].replace("+", "").split("?")[0]
-                        try:
-                            await client(ImportChatInviteRequest(hash_code))
-                        except Exception:
-                            pass
-                        entity = await client.get_entity(g_item)
-                    else:
-                        target = int(g_item) if g_item.lstrip("-").isdigit() else g_item
-                        entity = await client.get_entity(target)
-
+                    # 1. الانضمام الذكي للجروب
+                    entity = await join_group_if_needed(client, g_item)
                     if entity:
+                        # 2. قراءة الرسائل كبشري
                         await simulate_human_reading(client, entity)
+
+                        # 3. إرسال السالفة التلقائية
                         spontaneous_text = await generate_spontaneous_topic(character)
                         if spontaneous_text:
                             async with client.action(entity, 'typing'):
@@ -585,13 +605,13 @@ async def start_client_session(session_path):
                             await client.send_message(entity, spontaneous_text)
                             add_message(character, "assistant", spontaneous_text)
                             write_character(path, character)
-                            log.info("أرسل الحساب سالفة بشرية عفوية بالجروب.")
+                            log.info(f"أرسل الحساب ({me.first_name}) سالفة بشرية بالجروب بنجاح.")
                             break
                 except Exception as e:
-                    log.error(f"خطأ في السوالف التلقائية بالجروب {g_item}: {e}")
+                    log.error(f"خطأ أثناء السوالف بالجروب {g_item}: {e}")
 
     client.loop.create_task(spontaneous_chat_task())
-    log.info(f"تم تشغيل السوالف البشرية بنجاح: {session_path.name}")
+    log.info(f"تم تشغيل الحساب والتأكد من انضمامه وسوالفه: {session_path.name}")
     return client
 
 
@@ -623,7 +643,7 @@ async def main():
         if c:
             clients.append(c)
 
-    log.info("النظام يعمل بكامل طاقته بالسوالف والتفاعل البشري العراقي الطبيعي.")
+    log.info("النظام يعمل بكامل ميزاته وانضمامه التلقائي.")
 
     tasks = [c.run_until_disconnected() for c in clients]
     if tasks:
