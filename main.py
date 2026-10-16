@@ -1,353 +1,692 @@
 import asyncio
+import logging
 import os
 import random
-import re
-import shutil
-import requests
+import sqlite3
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F
+import requests
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
-from telethon.tl.functions.channels import JoinChannelRequest
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
-BASE = Path(__file__).parent
+# ==================================================
+# الإعدادات - Railway Variables
+# ==================================================
 
-SESSIONS_DIR = BASE / "sessions"
-SESSIONS_DIR.mkdir(exist_ok=True)
+BOT_TOKEN = os.getenv("7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8", "")
+GEMINI_API_KEY = os.getenv("AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg", "")
 
-TMP_SESSIONS_DIR = Path("/tmp/sessions_safe")
-if TMP_SESSIONS_DIR.exists():
-    shutil.rmtree(TMP_SESSIONS_DIR)
-TMP_SESSIONS_DIR.mkdir(exist_ok=True)
+# رقم حساب المشرف. إذا أكثر من مشرف، افصل الأرقام بفاصلة.
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("7199778669", "").split(",")
+    if x.strip().isdigit()
+}
 
-# ==================== معلوماتك الشخصية ====================
-CONTROL_TOKEN = "7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8"
-API_ID = 20400000  # استبدلها برقم الـ API ID الحقيقي إذا لزم الأمر
-API_HASH = "ضع_الـ_API_HASH_هنا"
-TARGET_CHAT = -1004309527352
-TARGET_CHANNEL_LINK = "https://t.me/DialoguesAi"
-ADMIN_IDS = {7199778669}
+# مسار التخزين الدائم في Railway Volume
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# مفتاح Gemini الخاص بك
-GEMINI_API_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
+DB_PATH = DATA_DIR / "arena.db"
 
-DELAY = 25
-MAX_TURNS = 20
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+)
+
 MAX_REPLY_CHARS = 900
-# ==========================================================
+HISTORY_LIMIT = 12
 
-if not CONTROL_TOKEN:
-    raise SystemExit("يرجى وضع توكن بوت التحكم في الكود!")
+if not BOT_TOKEN:
+    raise SystemExit("❌ أضف BOT_TOKEN في Railway Variables")
+
+if not GEMINI_API_KEY:
+    raise SystemExit("❌ أضف GEMINI_API_KEY في Railway Variables")
+
 if not ADMIN_IDS:
-    raise SystemExit("يرجى وضع ADMIN_IDS في الكود!")
+    raise SystemExit("❌ أضف ADMIN_IDS في Railway Variables")
 
-class SimpleStore:
-    def __init__(self):
-        self.settings = {"topic": "سوالف عامة عن الأنمي والحياة اليومية", "running": "0", "next_character": ""}
-        self.messages = []
-        self.memories = {"shared": ""}
 
-    def get_setting(self, key, default=""):
-        return self.settings.get(key, default)
+# ==================================================
+# تسجيل الأخطاء
+# ==================================================
 
-    def set_setting(self, key, value):
-        self.settings[key] = value
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
-    def get_memory(self, key):
-        return self.memories.get(key, "")
+log = logging.getLogger("telegram-bot")
 
-    def append_memory(self, key, text):
-        if key not in self.memories:
-            self.memories[key] = ""
-        self.memories[key] += "\n" + text
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
-    def add_message(self, speaker_id, speaker_name, text):
-        self.messages.append({"speaker_id": speaker_id, "speaker_name": speaker_name, "text": text})
-
-    def recent_messages(self, limit=12):
-        return self.messages[-limit:]
-
-    def is_duplicate(self, text):
-        return any(m["text"] == text for m in self.messages[-5:])
-
-store = SimpleStore()
-bot = Bot(CONTROL_TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-clients: dict[str, TelegramClient] = {}
-characters_dict: dict[str, dict] = {}
-engine_task: asyncio.Task | None = None
-stop_event = asyncio.Event()
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
 
-def get_main_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="تشغيل الحوار 🟢", callback_data="btn_run"),
-            InlineKeyboardButton(text="إيقاف الحوار ⏸️", callback_data="btn_pause")
-        ],
-        [
-            InlineKeyboardButton(text="الحالة 📊", callback_data="btn_status"),
-            InlineKeyboardButton(text="الشخصيات 👥", callback_data="btn_chars")
-        ]
-    ])
+# ==================================================
+# SQLite - قاعدة البيانات والذاكرة
+# ==================================================
 
-async def load_and_join_sessions():
-    global characters_dict
-    session_files = list(SESSIONS_DIR.glob("*.session"))
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
-    for sf in session_files:
-        char_id = sf.stem
-        if char_id in clients and clients[char_id].is_connected():
-            continue
-            
-        try:
-            # عزل تام لملف الجلسة لمنع قفل قاعدة البيانات نهائياً
-            tmp_sf = TMP_SESSIONS_DIR / sf.name
-            if sf.exists() and not tmp_sf.exists():
-                shutil.copy(sf, tmp_sf)
 
-            client = TelegramClient(str(tmp_sf).replace(".session", ""), API_ID, API_HASH, connection_retries=5, timeout=30)
-            await client.connect()
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                name = me.first_name or char_id
-                
-                try:
-                    await client(JoinChannelRequest(TARGET_CHANNEL_LINK))
-                except Exception:
-                    pass
+def init_db():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                personality TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )
+        """)
 
-                clients[char_id] = client
-                characters_dict[char_id] = {
-                    "id": char_id,
-                    "name": name,
-                    "enabled": True,
-                    "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف. ردودك قصيرة (1-4 جمل) وبدون مقدمات أو كتابة اسمك في بداية الرسالة."
-                }
-                print(f"تم تحميل وتجهيز الشخصية بنجاح: {name}")
-            else:
-                await client.disconnect()
-        except Exception as e:
-            print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                speaker TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-def call_gemini_smart(prompt: str) -> str:
-    models = ["gemini-pro", "gemini-1.5-flash", "gemini-1.5-pro"]
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
-    
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            response = requests.post(url, json=data, headers=headers, timeout=15)
-            res_json = response.json()
-            if "candidates" in res_json and len(res_json["candidates"]) > 0:
-                text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                if text:
-                    return text
-        except Exception:
-            continue
-            
-    return ""
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
 
-async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
-    current_topic = topic if topic else 'سوالف عامة'
-    priv_mem = private_memory if private_memory else 'لا توجد'
-    shared_mem = shared_memory if shared_memory else 'بداية الحوار'
-    
-    prompt_history = f"الموضوع الحالي: {current_topic}\nذاكرتك الخاصة: {priv_mem}\nملخص الحوار: {shared_mem}\n\nآخر رسائل الكروب:\n"
-    for item in recent[-12:]:
-        prompt_history += f"{item['speaker_name']}: {item['text']}\n"
-        
-    full_prompt = (
-        f"{char['system_prompt']}\n\n"
-        f"{prompt_history}\n"
-        f"اكتب رد الشخصية {char['name']} الآن باللهجة العراقية الطبيعية فقط:"
-    )
-    
-    raw_text = await asyncio.to_thread(call_gemini_smart, full_prompt)
-    text = raw_text.strip()
-    text = re.sub(r"^(" + char['name'] + r")\s*[:：-]\s*", "", text)
-    return text[:MAX_REPLY_CHARS].strip()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+        """)
 
-async def run_arena():
-    turns = 0
-    while not stop_event.is_set() and turns < MAX_TURNS:
-        await load_and_join_sessions()
-        enabled = [c for c in characters_dict.values() if c.get("enabled", True) and c["id"] in clients]
-        if len(enabled) < 2:
-            print("العدد غير كافٍ، يرجى التأكد من تفعيل حسابين على الأقل...")
-            await asyncio.sleep(5)
-            continue
-            
-        char = random.choice(enabled)
-        try:
-            recent = store.recent_messages(12)
-            shared = store.get_memory("shared")
-            private = store.get_memory(char["id"])
-            topic = store.get_setting("topic", "")
-            reply = await generate_reply(char, shared, private, recent, topic)
-            if not reply or store.is_duplicate(reply):
-                await asyncio.sleep(2)
-                continue
-            await clients[char["id"]].send_message(TARGET_CHAT, reply)
-            store.add_message(char["id"], char["name"], reply)
-            store.append_memory(char["id"], f"آخر مساهمة: {reply}")
-            store.append_memory("shared", f"{char['name']}: {reply}")
-            turns += 1
-            await asyncio.sleep(DELAY)
-        except FloodWaitError as e:
-            await asyncio.sleep(min(int(e.seconds) + 2, 3600))
-        except (RPCError, RuntimeError, Exception) as e:
-            print(f"[arena] {char.get('name', '?')}: {type(e).__name__}: {e}")
-            await asyncio.sleep(max(DELAY, 30))
-    store.set_setting("running", "0")
-
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    await load_and_join_sessions()
-    await message.answer(
-        "أهلاً بك في لوحة تحكم AI Social Arena (Final Fixed) 🎭\nاختر أحد الخيارات أدناه:",
-        reply_markup=get_main_keyboard()
-    )
-
-@dp.callback_query(F.data.startswith("btn_"))
-async def callback_handler(callback: CallbackQuery):
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer("عذراً، هذا البوت مخصص للمشرفين فقط.", show_alert=True)
-        return
-
-    action = callback.data
-    global engine_task, stop_event
-
-    if action == "btn_run":
-        if not TARGET_CHAT:
-            await callback.answer("يرجى ضبط TARGET_CHAT في الكود أولاً.", show_alert=True)
-            return
-        if engine_task and not engine_task.done():
-            await callback.answer("الحوار يعمل بالفعل 🟢", show_alert=True)
-            return
-            
-        stop_event = asyncio.Event()
-        store.set_setting("running", "1")
-        engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("جاري انضمام الحسابات وبدء السوالف بشكل آمن تماماً... 🟢", reply_markup=get_main_keyboard())
-        await callback.answer("تم التشغيل والانضمام")
-
-    elif action == "btn_pause":
-        stop_event.set()
-        if engine_task:
-            engine_task.cancel()
-            try:
-                await engine_task
-            except asyncio.CancelledError:
-                pass
-        store.set_setting("running", "0")
-        await callback.message.edit_text("تم إيقاف الحوار مؤقتاً ⏸️", reply_markup=get_main_keyboard())
-        await callback.answer("تم الإيقاف")
-
-    elif action == "btn_status":
-        await load_and_join_sessions()
-        enabled_count = len([c for c in characters_dict.values() if c.get("enabled")])
-        state = "شغّال 🟢" if engine_task and not engine_task.done() else "متوقف 🔴"
-        text = (
-            f"📊 **حالة النظام:**\n"
-            f"• الحالة: {state}\n"
-            f"• الحسابات المفعلة: {enabled_count} من {len(characters_dict)}\n"
-            f"• الكروب: {TARGET_CHANNEL_LINK}\n"
-            f"• النظام: آمن تماماً ضد قفل قاعدة البيانات\n"
-            f"• الفاصل الزمني: {DELAY} ثانية"
+        con.execute(
+            "INSERT OR IGNORE INTO settings VALUES(?, ?)",
+            ("topic", "سوالف عامة باللهجة العراقية"),
         )
-        await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-        await callback.answer()
 
-    elif action == "btn_chars":
-        await load_and_join_sessions()
-        if not characters_dict:
-            await callback.message.edit_text("👥 **الشخصيات:**\nلم يتم العثور على ملفات جلسات في مجلد `sessions`.", reply_markup=get_main_keyboard())
-            await callback.answer()
-            return
+        con.execute(
+            "INSERT OR IGNORE INTO memories VALUES(?, ?)",
+            ("shared", ""),
+        )
 
-        keyboard_buttons = []
-        for cid, c in characters_dict.items():
-            status_icon = "🟢" if c.get("enabled", True) else "⚪"
-            keyboard_buttons.append([
-                InlineKeyboardButton(text=f"{status_icon} {c['name']}", callback_data=f"toggle_{cid}"),
-                InlineKeyboardButton(text="تبديل الحالة 🔄", callback_data=f"toggle_{cid}")
-            ])
-        
-        keyboard_buttons.append([
-            InlineKeyboardButton(text="تحديد الكل 🟢", callback_data="all_on"),
-            InlineKeyboardButton(text="إلغاء تحديد الكل 🔴", callback_data="all_off")
-        ])
-        keyboard_buttons.append([InlineKeyboardButton(text="العودة للقائمة الرئيسية 🔙", callback_data="back_home")])
+        characters = [
+            ("سارة", "مرحة واجتماعية وتحب المزاح الخفيف."),
+            ("علي", "هادئ وذكي ويحب التحليل والنقاش."),
+            ("نور", "فضولية ولطيفة وتسأل أسئلة ممتعة."),
+            ("كرار", "عفوي ويحب النكت العراقية."),
+        ]
 
-        text = "👥 **إدارة حسابات الجلسات (اضغط لتبديل حالة الحساب):**"
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons), parse_mode="Markdown")
-        await callback.answer()
+        for name, personality in characters:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO characters(name, personality)
+                VALUES(?, ?)
+                """,
+                (name, personality),
+            )
 
-@dp.callback_query(F.data.startswith("toggle_") | F.data.in_({"all_on", "all_off", "back_home"}))
-async def chars_management_handler(callback: CallbackQuery):
-    data = callback.data
-    if data == "back_home":
-        await callback.message.edit_text("أهلاً بك في لوحة تحكم AI Social Arena 🎭\nاختر أحد الخيارات أدناه:", reply_markup=get_main_keyboard())
-        await callback.answer()
-        return
 
-    if data == "all_on":
-        for c in characters_dict.values():
-            c["enabled"] = True
-        await callback.answer("تم تفعيل جميع الحسابات ✅", show_alert=True)
-    elif data == "all_off":
-        for c in characters_dict.values():
-            c["enabled"] = False
-        await callback.answer("تم تعطيل جميع الحسابات ❌", show_alert=True)
-    elif data.startswith("toggle_"):
-        cid = data.replace("toggle_", "")
-        if cid in characters_dict:
-            characters_dict[cid]["enabled"] = not characters_dict[cid]["enabled"]
-            state_text = "تم التفعيل 🟢" if characters_dict[cid]["enabled"] else "تم التعطيل ⚪"
-            await callback.answer(state_text)
+def get_setting(key, default=""):
+    with db() as con:
+        row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (key,),
+        ).fetchone()
 
-    keyboard_buttons = []
-    for cid, c in characters_dict.items():
-        status_icon = "🟢" if c.get("enabled", True) else "⚪"
-        keyboard_buttons.append([
-            InlineKeyboardButton(text=f"{status_icon} {c['name']}", callback_data=f"toggle_{cid}"),
-            InlineKeyboardButton(text="تبديل الحالة 🔄", callback_data=f"toggle_{cid}")
-        ])
-    
-    keyboard_buttons.append([
-        InlineKeyboardButton(text="تحديد الكل 🟢", callback_data="all_on"),
-        InlineKeyboardButton(text="إلغاء تحديد الكل 🔴", callback_data="all_off")
-    ])
-    keyboard_buttons.append([InlineKeyboardButton(text="العودة للقائمة الرئيسية 🔙", callback_data="back_home")])
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with db() as con:
+        con.execute(
+            """
+            INSERT INTO settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, str(value)),
+        )
+
+
+def get_characters(enabled_only=False):
+    query = "SELECT * FROM characters"
+
+    if enabled_only:
+        query += " WHERE enabled=1"
+
+    query += " ORDER BY id"
+
+    with db() as con:
+        return [
+            dict(row)
+            for row in con.execute(query).fetchall()
+        ]
+
+
+def toggle_character(char_id):
+    with db() as con:
+        con.execute(
+            """
+            UPDATE characters
+            SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END
+            WHERE id=?
+            """,
+            (char_id,),
+        )
+
+
+def enable_all(value):
+    with db() as con:
+        con.execute(
+            "UPDATE characters SET enabled=?",
+            (int(value),),
+        )
+
+
+def save_message(speaker, text):
+    with db() as con:
+        con.execute(
+            "INSERT INTO messages(speaker, text) VALUES(?, ?)",
+            (speaker, text),
+        )
+
+        con.execute("""
+            DELETE FROM messages
+            WHERE id NOT IN (
+                SELECT id FROM messages
+                ORDER BY id DESC LIMIT 500
+            )
+        """)
+
+
+def get_history(limit=HISTORY_LIMIT):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT speaker, text FROM messages
+            ORDER BY id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in reversed(rows)]
+
+
+def get_memory():
+    with db() as con:
+        row = con.execute(
+            "SELECT value FROM memories WHERE key='shared'"
+        ).fetchone()
+
+    return row["value"] if row else ""
+
+
+def save_memory(text):
+    memory = (get_memory() + "\n" + text).strip()
+    memory = memory[-5000:]
+
+    with db() as con:
+        con.execute(
+            """
+            INSERT INTO memories(key, value) VALUES('shared', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (memory,),
+        )
+
+
+# ==================================================
+# Gemini
+# ==================================================
+
+def gemini_generate(prompt):
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "تحدث باللهجة العراقية الطبيعية. "
+                    "أنت تؤدي شخصية خيالية. "
+                    "لا تدّعِ أنك إنسان حقيقي. "
+                    "اجعل الرد مختصراً وطبيعياً."
+                )
+            }]
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": prompt}],
+        }],
+        "generationConfig": {
+            "temperature": 0.9,
+            "maxOutputTokens": 300,
+        },
+    }
 
     try:
-        await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
-    except Exception:
-        pass
+        response = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=35,
+        )
+
+        if not response.ok:
+            log.error(
+                "Gemini HTTP %s: %s",
+                response.status_code,
+                response.text[:1000],
+            )
+            return None, f"خطأ Gemini HTTP {response.status_code}"
+
+        data = response.json()
+        candidates = data.get("candidates", [])
+
+        if not candidates:
+            log.error("Gemini returned no candidates")
+            return None, "Gemini لم يرجع جواباً."
+
+        parts = candidates[0].get(
+            "content", {}
+        ).get("parts", [])
+
+        answer = "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part.get("text"), str)
+        ).strip()
+
+        if not answer:
+            return None, "الرد فارغ."
+
+        return answer[:MAX_REPLY_CHARS], None
+
+    except requests.RequestException as exc:
+        log.exception("Gemini connection failed")
+        return None, f"فشل الاتصال: {type(exc).__name__}"
+
+    except (ValueError, TypeError, KeyError):
+        log.exception("Invalid Gemini response")
+        return None, "تعذر تحليل استجابة Gemini."
+
+
+async def generate_reply(character, user_text):
+    history = "\n".join(
+        f"{item['speaker']}: {item['text']}"
+        for item in get_history()
+    )
+
+    prompt = f"""
+اسم الشخصية: {character['name']}
+طبع الشخصية: {character['personality']}
+
+موضوع الحوار:
+{get_setting('topic')}
+
+الذاكرة السابقة:
+{get_memory() or 'لا توجد ذاكرة محفوظة'}
+
+آخر الرسائل:
+{history or 'لا توجد رسائل سابقة'}
+
+رسالة المستخدم:
+{user_text}
+
+اكتب رداً واحداً باللهجة العراقية من جملة إلى ثلاث جمل.
+لا تكتب اسم الشخصية في بداية الرد.
+لا تكرر الردود السابقة حرفياً.
+"""
+
+    answer, error = await asyncio.to_thread(
+        gemini_generate,
+        prompt,
+    )
+
+    return answer, error
+
+
+# ==================================================
+# لوحة التحكم العربية
+# ==================================================
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+def panel_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="الحالة 📊",
+                    callback_data="status",
+                ),
+                InlineKeyboardButton(
+                    text="الشخصيات 🎭",
+                    callback_data="characters",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="اختبار Gemini 🧪",
+                    callback_data="test",
+                ),
+                InlineKeyboardButton(
+                    text="طريقة تغيير الموضوع 📝",
+                    callback_data="topic",
+                ),
+            ],
+        ]
+    )
+
+
+async def safe_edit(message, text, markup=None):
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=markup,
+        )
+
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+
+        log.exception("Failed to edit panel message")
+
+
+async def show_characters(callback):
+    rows = []
+
+    for char in get_characters():
+        icon = "🟢" if char["enabled"] else "⚪"
+
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} {char['name']}",
+                callback_data=f"char:{char['id']}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="تفعيل الكل",
+            callback_data="all:on",
+        ),
+        InlineKeyboardButton(
+            text="تعطيل الكل",
+            callback_data="all:off",
+        ),
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="رجوع 🔙",
+            callback_data="home",
+        )
+    ])
+
+    await safe_edit(
+        callback.message,
+        "🎭 إدارة الشخصيات\nاضغط على الشخصية لتفعيلها أو تعطيلها.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.message(Command("start", "panel"))
+async def panel_command(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer(
+        "أهلاً بك في لوحة التحكم 🎛️",
+        reply_markup=panel_keyboard(),
+    )
+
+
+@dp.message(Command("topic"))
+async def topic_command(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    topic = (message.text or "").partition(" ")[2].strip()
+
+    if not topic:
+        await message.answer(
+            "اكتب الموضوع هكذا:\n/topic نقاش عن الأنمي"
+        )
+        return
+
+    set_setting("topic", topic[:300])
+
+    await message.answer(
+        f"✅ تم تغيير موضوع الحوار إلى:\n{topic[:300]}"
+    )
+
+
+@dp.message(Command("speak"))
+async def speak_command(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    characters = get_characters(enabled_only=True)
+
+    if not characters:
+        await message.answer("❌ لا توجد شخصيات مفعّلة.")
+        return
+
+    user_text = (message.text or "").partition(" ")[2].strip()
+
+    if not user_text:
+        user_text = f"ابدأ حديثاً عن: {get_setting('topic')}"
+
+    character = random.choice(characters)
+
+    status = await message.answer(
+        f"⏳ الشخصية {character['name']} تكتب الرد..."
+    )
+
+    answer, error = await generate_reply(
+        character,
+        user_text,
+    )
+
+    if error or not answer:
+        await safe_edit(
+            status,
+            f"❌ فشل توليد الرد:\n{error or 'رد فارغ'}",
+        )
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=f"🎭 {character['name']}:\n{answer}",
+        )
+
+        save_message(character["name"], answer)
+        save_memory(f"{character['name']}: {answer}")
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+    except Exception as exc:
+        log.exception("Telegram send failed")
+
+        await safe_edit(
+            status,
+            f"❌ فشل الإرسال:\n{type(exc).__name__}: {str(exc)[:250]}",
+        )
+
+
+@dp.message(Command("remember"))
+async def remember_command(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    text = (message.text or "").partition(" ")[2].strip()
+
+    if not text:
+        await message.answer(
+            "استخدم الأمر هكذا:\n/remember معلومة للحفظ"
+        )
+        return
+
+    save_memory(text[:1000])
+    await message.answer("✅ تم حفظ المعلومة في SQLite.")
+
+
+@dp.message(Command("memory"))
+async def memory_command(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    memory = get_memory()
+
+    await message.answer(
+        "🧠 الذاكرة:\n" + memory[-3500:]
+        if memory
+        else "الذاكرة فارغة."
+    )
+
+
+@dp.callback_query()
+async def callback_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "هذه اللوحة للمشرف فقط.",
+            show_alert=True,
+        )
+        return
+
+    data = callback.data or ""
+
+    try:
+        if data == "home":
+            await safe_edit(
+                callback.message,
+                "لوحة التحكم 🎛️",
+                panel_keyboard(),
+            )
+
+        elif data == "status":
+            chars = get_characters()
+            enabled = sum(
+                1 for char in chars if char["enabled"]
+            )
+
+            await safe_edit(
+                callback.message,
+                f"📊 حالة البوت\n"
+                f"الشخصيات المفعّلة: {enabled}/{len(chars)}\n"
+                f"قاعدة البيانات: {DB_PATH}\n"
+                f"الموضوع: {get_setting('topic')}",
+                panel_keyboard(),
+            )
+
+        elif data == "characters":
+            await show_characters(callback)
+
+        elif data.startswith("char:"):
+            char_id = int(data.split(":", 1)[1])
+            toggle_character(char_id)
+            await show_characters(callback)
+
+        elif data == "all:on":
+            enable_all(True)
+            await show_characters(callback)
+
+        elif data == "all:off":
+            enable_all(False)
+            await show_characters(callback)
+
+        elif data == "topic":
+            await safe_edit(
+                callback.message,
+                "لتغيير الموضوع أرسل:\n/topic موضوع الحوار",
+                panel_keyboard(),
+            )
+
+        elif data == "test":
+            await callback.answer("جارٍ اختبار Gemini...")
+
+            answer, error = await asyncio.to_thread(
+                gemini_generate,
+                "اكتب جملة عراقية قصيرة تقول فيها مرحباً.",
+            )
+
+            if error:
+                text = f"❌ فشل الاختبار:\n{error}"
+            else:
+                text = f"✅ Gemini يعمل:\n{answer}"
+
+            await safe_edit(
+                callback.message,
+                text,
+                panel_keyboard(),
+            )
+
+        await callback.answer()
+
+    except Exception as exc:
+        log.exception("Callback error")
+
+        try:
+            await callback.answer(
+                f"حدث خطأ: {type(exc).__name__}",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+
+
+# ==================================================
+# تشغيل البوت
+# ==================================================
 
 async def main():
-    print("تم بدء تشغيل بوت التحكم، النظام الآمن للجلسات والاتصال يعمل بكفاءة...")
-    await load_and_join_sessions()
+    init_db()
+
+    log.info("Bot started")
+    log.info("SQLite path: %s", DB_PATH)
+
     try:
         await dp.start_polling(bot)
     finally:
-        stop_event.set()
-        if engine_task:
-            engine_task.cancel()
-        for client in clients.values():
-            await client.disconnect()
         await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
