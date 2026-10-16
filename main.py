@@ -1,6 +1,4 @@
 import asyncio
-import hashlib
-import json
 import os
 import random
 import re
@@ -15,9 +13,9 @@ from telethon.errors import FloodWaitError, RPCError
 
 BASE = Path(__file__).parent
 
-# ==================== تم دمج معلوماتك هنا بنجاح ====================
+# ==================== معلوماتك الشخصية ====================
 CONTROL_TOKEN = "7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8"
-API_ID = 20400000  # ضع الـ API ID الخاص بك هنا (أرقام فقط)
+API_ID = 20400000  # استبدلها برقم الـ API ID الحقيقي إذا لزم الأمر
 API_HASH = "ضع_الـ_API_HASH_هنا"
 TARGET_CHAT = -1004309527352
 ADMIN_IDS = {7199778669}
@@ -25,15 +23,13 @@ ADMIN_IDS = {7199778669}
 DEFAULT_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
 AI_BASE_URL = "https://api.openai.com/v1"
 
-DELAY = 25  # الفاصل الزمني بالثواني بين الرسائل
-MAX_TURNS = 20  # حد الرسائل في الجولة الواحدة
+DELAY = 25
+MAX_TURNS = 20
 MAX_REPLY_CHARS = 900
-# =========================================================================
+# ==========================================================
 
 if not CONTROL_TOKEN:
     raise SystemExit("يرجى وضع توكن بوت التحكم في الكود!")
-if not API_ID or not API_HASH:
-    raise SystemExit("يرجى وضع TELEGRAM_API_ID و TELEGRAM_API_HASH في الكود!")
 if not ADMIN_IDS:
     raise SystemExit("يرجى وضع ADMIN_IDS في الكود!")
 
@@ -44,7 +40,7 @@ CHARACTERS = [
         "model": "gpt-4o-mini",
         "api_key_env": DEFAULT_KEY,
         "enabled": True,
-        "session": "ali.session",  # اسم ملف جلسة علي
+        "session": "ali.session",
         "system_prompt": "أنت شخص اسمه علي، تحب الأنمي وتسولف بطريقة طبيعية وعراقية عفوية."
     },
     {
@@ -53,7 +49,7 @@ CHARACTERS = [
         "model": "gpt-4o-mini",
         "api_key_env": DEFAULT_KEY,
         "enabled": True,
-        "session": "zainab.session",  # اسم ملف جلسة زينب
+        "session": "zainab.session",
         "system_prompt": "أنتِ شخصية اسمها زينب، مهتمة بالنقاشات والمسلسلات وتتحدثين باللهجة العراقية."
     }
 ]
@@ -114,9 +110,6 @@ def get_main_keyboard():
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
     key = DEFAULT_KEY
-    if not key:
-        raise RuntimeError(f"مفتاح النموذج غير مضبوط للشخصية {char['name']}")
-    
     client = AsyncOpenAI(api_key=key, base_url=AI_BASE_URL)
     
     current_topic = topic if topic else 'سوالف عامة عن الأنمي والحياة اليومية'
@@ -144,13 +137,37 @@ async def generate_reply(char, shared_memory: str, private_memory: str, recent: 
     finally:
         await client.close()
 
+async def connect_clients():
+    """محاولة ربط الحسابات إذا كانت ملفات الجلسات موجودة"""
+    for char in CHARACTERS:
+        if not char.get("enabled", True):
+            continue
+        if char["id"] in clients:
+            continue
+        
+        session_path = BASE / char["session"]
+        if session_path.exists():
+            try:
+                client = TelegramClient(str(session_path), API_ID, API_HASH)
+                await client.connect()
+                if await client.is_user_authorized():
+                    clients[char["id"]] = client
+                    print(f"تم ربط الشخصية بنجاح: {char['name']}")
+                else:
+                    print(فأرغ("جلسة غير صالحة لـ", char['name']))
+            except Exception as e:
+                print(f"خطأ في الاتصال للشخصية {char['name']}: {e}")
+
 async def run_arena():
     turns = 0
     while not stop_event.is_set() and turns < MAX_TURNS:
+        await connect_clients()
         enabled = [c for c in CHARACTERS if c.get("enabled", True) and c["id"] in clients]
         if len(enabled) < 2:
+            print("بانتظار توفر ملفات الجلسات للحسابات...")
             await asyncio.sleep(5)
             continue
+            
         next_id = store.get_setting("next_character", "") or ""
         char = get_character(next_id) if next_id else None
         if not char or char["id"] not in clients:
@@ -203,13 +220,11 @@ async def callback_handler(callback: CallbackQuery):
         if engine_task and not engine_task.done():
             await callback.answer("الحوار يعمل بالفعل 🟢", show_alert=True)
             return
-        if len([c for c in CHARACTERS if c.get("enabled", True) and c["id"] in clients]) < 2:
-            await callback.answer("لا توجد شخصيات كافية متصلة.", show_alert=True)
-            return
+            
         stop_event = asyncio.Event()
         store.set_setting("running", "1")
         engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("بدأت جولة الحوار بنجاح! 🟢", reply_markup=get_main_keyboard())
+        await callback.message.edit_text("بدأت جولة الحوار (سيبدأ النشر فور توفر الجلسات) 🟢", reply_markup=get_main_keyboard())
         await callback.answer("تم التشغيل")
 
     elif action == "btn_pause":
@@ -225,10 +240,13 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer("تم الإيقاف")
 
     elif action == "btn_status":
+        await connect_clients()
+        connected_count = len(clients)
         state = "شغّال 🟢" if engine_task and not engine_task.done() else "متوقف 🔴"
         text = (
             f"📊 **حالة النظام:**\n"
             f"• الحالة: {state}\n"
+            f"• الجلسات المتصلة: {connected_count} من {len(CHARACTERS)}\n"
             f"• المجموعة: {TARGET_CHAT}\n"
             f"• الموضوع: {store.get_setting('topic', 'سوالف عامة')}\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
@@ -237,22 +255,13 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer()
 
     elif action == "btn_chars":
-        lines = [f"• {'🟢' if c.get('enabled', True) else '⚪'} {c['name']} ({c['id']})" for c in CHARACTERS]
-        text = "👥 **الشخصيات المتاحة:**\n" + "\n".join(lines)
+        lines = [f"• {'🟢' if c['id'] in clients else '⚪'} {c['name']} ({c['id']})" for c in CHARACTERS]
+        text = "👥 **الشخصيات وحالة جلساتها:**\n" + "\n".join(lines) + "\n\n(⚪ تعني لم يتم العثور على ملف الجلسة بعد)"
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
         await callback.answer()
 
 async def main():
-    for char in CHARACTERS:
-        if not char.get("enabled", True):
-            continue
-        
-        session_path = BASE / char["session"]
-        client = TelegramClient(str(session_path), API_ID, API_HASH)
-        await client.start()
-        clients[char["id"]] = client
-        print(f"Connected: {char['name']}")
-
+    print("تم بدء تشغيل بوت التحكم بنجاح، بانتظار أوامرك وملفات الجلسات...")
     try:
         await dp.start_polling(bot)
     finally:
