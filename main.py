@@ -34,6 +34,7 @@ if not API_ID or not API_HASH:
 if not ADMIN_IDS:
     raise SystemExit("ضع ADMIN_IDS داخل .env")
 
+# تعريف الشخصيات مع ربطها بملفات الجلسات مباشرة بكل بساطة
 CHARACTERS = [
     {
         "id": "ali",
@@ -41,7 +42,7 @@ CHARACTERS = [
         "model": "gpt-4o-mini",
         "api_key_env": "AI_DEFAULT_API_KEY",
         "enabled": True,
-        "keywords": ["علي", "ali", "حسين", "محمد"],
+        "session": "ali.session",  # اسم ملف جلسة علي
         "system_prompt": "أنت شخص اسمه علي، تحب الأنمي وتسولف بطريقة طبيعية وعراقية عفوية."
     },
     {
@@ -50,7 +51,7 @@ CHARACTERS = [
         "model": "gpt-4o-mini",
         "api_key_env": "AI_DEFAULT_API_KEY",
         "enabled": True,
-        "keywords": ["زينب", "zainab", "فاطمة", "fatima", "مريم", "نور"],
+        "session": "zainab.session",  # اسم ملف جلسة زينب
         "system_prompt": "أنتِ شخصية اسمها زينب، مهتمة بالنقاشات والمسلسلات وتتحدثين باللهجة العراقية."
     }
 ]
@@ -240,20 +241,26 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer()
 
 async def main():
-    session_files = list(BASE.glob("*.session"))
-    print(f"تم العثور على ملفات الجلسات: {[f.name for f in session_files]}")
-
-    matched_sessions = set()
-
+    # ربط ملفات الجلسات مباشرة وبكل سهولة بدون تعقيد
     for char in CHARACTERS:
         if not char.get("enabled", True):
             continue
+        
+        session_path = BASE / char["session"]
+        client = TelegramClient(str(session_path), API_ID, API_HASH)
+        await client.start()
+        clients[char["id"]] = client
+        print(f"Connected: {char['name']}")
 
-        assigned_client = None
-        assigned_file = None
+    try:
+        await dp.start_polling(bot)
+    finally:
+        stop_event.set()
+        if engine_task:
+            engine_task.cancel()
+        for client in clients.values():
+            await client.disconnect()
+        await bot.session.close()
 
-        for sf in session_files:
-            if sf in matched_sessions:
-                continue
-            try:
-                temp_client = Telegram
+if __name__ == "__main__":
+    asyncio.run(main())
