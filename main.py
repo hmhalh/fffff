@@ -13,6 +13,10 @@ from telethon.errors import FloodWaitError, RPCError
 
 BASE = Path(__file__).parent
 
+# إنشاء مجلد الجلسات تلقائياً إذا لم يكن موجوداً
+SESSIONS_DIR = BASE / "sessions"
+SESSIONS_DIR.mkdir(exist_ok=True)
+
 # ==================== معلوماتك الشخصية ====================
 CONTROL_TOKEN = "7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8"
 API_ID = 20400000  # استبدلها برقم الـ API ID الحقيقي إذا لزم الأمر
@@ -32,27 +36,6 @@ if not CONTROL_TOKEN:
     raise SystemExit("يرجى وضع توكن بوت التحكم في الكود!")
 if not ADMIN_IDS:
     raise SystemExit("يرجى وضع ADMIN_IDS في الكود!")
-
-CHARACTERS = [
-    {
-        "id": "ali",
-        "name": "علي",
-        "model": "gpt-4o-mini",
-        "api_key_env": DEFAULT_KEY,
-        "enabled": True,
-        "session": "ali.session",
-        "system_prompt": "أنت شخص اسمه علي، تحب الأنمي وتسولف بطريقة طبيعية وعراقية عفوية."
-    },
-    {
-        "id": "zainab",
-        "name": "زينب",
-        "model": "gpt-4o-mini",
-        "api_key_env": DEFAULT_KEY,
-        "enabled": True,
-        "session": "zainab.session",
-        "system_prompt": "أنتِ شخصية اسمها زينب، مهتمة بالنقاشات والمسلسلات وتتحدثين باللهجة العراقية."
-    }
-]
 
 class SimpleStore:
     def __init__(self):
@@ -87,14 +70,12 @@ store = SimpleStore()
 bot = Bot(CONTROL_TOKEN)
 dp = Dispatcher()
 clients: dict[str, TelegramClient] = {}
+characters_list: list[dict] = []
 engine_task: asyncio.Task | None = None
 stop_event = asyncio.Event()
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-def get_character(char_id: str):
-    return next((c for c in CHARACTERS if c["id"] == char_id and c.get("enabled", True)), None)
 
 def get_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -107,6 +88,40 @@ def get_main_keyboard():
             InlineKeyboardButton(text="الشخصيات 👥", callback_data="btn_chars")
         ]
     ])
+
+async def load_all_sessions():
+    """سحب جميع ملفات الجلسات من مجلد sessions تلقائياً"""
+    global characters_list
+    characters_list.clear()
+    
+    session_files = list(SESSIONS_DIR.glob("*.session"))
+    print(f"تم العثور على {len(session_files)} ملف جلسة في المجلد.")
+
+    for sf in session_files:
+        char_id = sf.stem  # اسم الملف بدون .session يعتبر كـ ID فريد للشخصية
+        try:
+            client = TelegramClient(str(sf), API_ID, API_HASH)
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                name = me.first_name or char_id
+                
+                clients[char_id] = client
+                characters_list.append({
+                    "id": char_id,
+                    "name": name,
+                    "model": "gpt-4o-mini",
+                    "enabled": True,
+                    "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف."
+                })
+                print(f"تم تحميل الشخصية بنجاح: {name} (الملف: {sf.name})")
+            else:
+                print(f"الجلسة غير صالحة أو منتهية: {sf.name}")
+        except Exception as e:
+            print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
+
+def get_character(char_id: str):
+    return next((c for c in characters_list if c["id"] == char_id and c.get("enabled", True)), None)
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
     key = DEFAULT_KEY
@@ -132,39 +147,18 @@ async def generate_reply(char, shared_memory: str, private_memory: str, recent: 
             max_tokens=220,
         )
         text = (result.choices[0].message.content or "").strip()
-        text = re.sub(r"^(علي|زينب|مصطفى)\s*[:：-]\s*", "", text)
+        text = re.sub(r"^(" + char['name'] + r")\s*[:：-]\s*", "", text)
         return text[:MAX_REPLY_CHARS].strip()
     finally:
         await client.close()
 
-async def connect_clients():
-    """محاولة ربط الحسابات إذا كانت ملفات الجلسات موجودة"""
-    for char in CHARACTERS:
-        if not char.get("enabled", True):
-            continue
-        if char["id"] in clients:
-            continue
-        
-        session_path = BASE / char["session"]
-        if session_path.exists():
-            try:
-                client = TelegramClient(str(session_path), API_ID, API_HASH)
-                await client.connect()
-                if await client.is_user_authorized():
-                    clients[char["id"]] = client
-                    print(f"تم ربط الشخصية بنجاح: {char['name']}")
-                else:
-                    print(فأرغ("جلسة غير صالحة لـ", char['name']))
-            except Exception as e:
-                print(f"خطأ في الاتصال للشخصية {char['name']}: {e}")
-
 async def run_arena():
     turns = 0
     while not stop_event.is_set() and turns < MAX_TURNS:
-        await connect_clients()
-        enabled = [c for c in CHARACTERS if c.get("enabled", True) and c["id"] in clients]
+        await load_all_sessions()
+        enabled = [c for c in characters_list if c.get("enabled", True) and c["id"] in clients]
         if len(enabled) < 2:
-            print("بانتظار توفر ملفات الجلسات للحسابات...")
+            print("العدد غير كافٍ، يرجى التأكد من وجود ملفات جلسات صالحة في مجلد sessions (على الأقل 2)...")
             await asyncio.sleep(5)
             continue
             
@@ -224,7 +218,7 @@ async def callback_handler(callback: CallbackQuery):
         stop_event = asyncio.Event()
         store.set_setting("running", "1")
         engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("بدأت جولة الحوار (سيبدأ النشر فور توفر الجلسات) 🟢", reply_markup=get_main_keyboard())
+        await callback.message.edit_text("بدأت جولة الحوار (جاري سحب الجلسات وبدء السوالف) 🟢", reply_markup=get_main_keyboard())
         await callback.answer("تم التشغيل")
 
     elif action == "btn_pause":
@@ -240,13 +234,13 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer("تم الإيقاف")
 
     elif action == "btn_status":
-        await connect_clients()
+        await load_all_sessions()
         connected_count = len(clients)
         state = "شغّال 🟢" if engine_task and not engine_task.done() else "متوقف 🔴"
         text = (
             f"📊 **حالة النظام:**\n"
             f"• الحالة: {state}\n"
-            f"• الجلسات المتصلة: {connected_count} من {len(CHARACTERS)}\n"
+            f"• الجلسات المكتشفة: {connected_count}\n"
             f"• المجموعة: {TARGET_CHAT}\n"
             f"• الموضوع: {store.get_setting('topic', 'سوالف عامة')}\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
@@ -255,13 +249,18 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer()
 
     elif action == "btn_chars":
-        lines = [f"• {'🟢' if c['id'] in clients else '⚪'} {c['name']} ({c['id']})" for c in CHARACTERS]
-        text = "👥 **الشخصيات وحالة جلساتها:**\n" + "\n".join(lines) + "\n\n(⚪ تعني لم يتم العثور على ملف الجلسة بعد)"
+        await load_all_sessions()
+        if not characters_list:
+            text = "👥 **الشخصيات:**\nلم يتم العثور على أي ملف جلسة في مجلد `sessions` بعد."
+        else:
+            lines = [f"• 🟢 {c['name']} (ID: {c['id']})" for c in characters_list]
+            text = "👥 **الشخصيات المتاحة من المجلد:**\n" + "\n".join(lines)
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
         await callback.answer()
 
 async def main():
-    print("تم بدء تشغيل بوت التحكم بنجاح، بانتظار أوامرك وملفات الجلسات...")
+    print("تم بدء تشغيل بوت التحكم، جاري فحص مجلد sessions...")
+    await load_all_sessions()
     try:
         await dp.start_polling(bot)
     finally:
