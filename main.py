@@ -13,7 +13,6 @@ from telethon.errors import FloodWaitError, RPCError
 
 BASE = Path(__file__).parent
 
-# إنشاء مجلد الجلسات تلقائياً إذا لم يكن موجوداً
 SESSIONS_DIR = BASE / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
@@ -90,15 +89,17 @@ def get_main_keyboard():
     ])
 
 async def load_all_sessions():
-    """سحب جميع ملفات الجلسات من مجلد sessions تلقائياً"""
+    """سحب جميع ملفات الجلسات من مجلد sessions بدون قفل قاعدة البيانات"""
     global characters_list
-    characters_list.clear()
     
     session_files = list(SESSIONS_DIR.glob("*.session"))
     print(f"تم العثور على {len(session_files)} ملف جلسة في المجلد.")
 
     for sf in session_files:
-        char_id = sf.stem  # اسم الملف بدون .session يعتبر كـ ID فريد للشخصية
+        char_id = sf.stem
+        if char_id in clients:
+            continue  # إذا كانت متصلة مسبقاً لا تعيد فتحها لتجنب الـ lock
+            
         try:
             client = TelegramClient(str(sf), API_ID, API_HASH)
             await client.connect()
@@ -107,16 +108,19 @@ async def load_all_sessions():
                 name = me.first_name or char_id
                 
                 clients[char_id] = client
-                characters_list.append({
-                    "id": char_id,
-                    "name": name,
-                    "model": "gpt-4o-mini",
-                    "enabled": True,
-                    "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف."
-                })
+                # التحقق من عدم تكرار الشخصية في القائمة
+                if not any(c["id"] == char_id for c in characters_list):
+                    characters_list.append({
+                        "id": char_id,
+                        "name": name,
+                        "model": "gpt-4o-mini",
+                        "enabled": True,
+                        "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف."
+                    })
                 print(f"تم تحميل الشخصية بنجاح: {name} (الملف: {sf.name})")
             else:
                 print(f"الجلسة غير صالحة أو منتهية: {sf.name}")
+                await client.disconnect()
         except Exception as e:
             print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
 
