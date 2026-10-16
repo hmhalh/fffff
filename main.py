@@ -10,6 +10,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from openai import AsyncOpenAI
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
+from telethon.tl.functions.channels import JoinChannelRequest
 
 BASE = Path(__file__).parent
 
@@ -21,6 +22,7 @@ CONTROL_TOKEN = "7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8"
 API_ID = 20400000  # استبدلها برقم الـ API ID الحقيقي إذا لزم الأمر
 API_HASH = "ضع_الـ_API_HASH_هنا"
 TARGET_CHAT = -1004309527352
+TARGET_CHANNEL_LINK = "https://t.me/DialoguesAi"
 ADMIN_IDS = {7199778669}
 
 DEFAULT_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
@@ -69,7 +71,7 @@ store = SimpleStore()
 bot = Bot(CONTROL_TOKEN)
 dp = Dispatcher()
 clients: dict[str, TelegramClient] = {}
-characters_list: list[dict] = []
+characters_dict: dict[str, dict] = {}
 engine_task: asyncio.Task | None = None
 stop_event = asyncio.Event()
 
@@ -88,17 +90,15 @@ def get_main_keyboard():
         ]
     ])
 
-async def load_all_sessions():
-    """سحب جميع ملفات الجلسات من مجلد sessions بدون قفل قاعدة البيانات"""
-    global characters_list
-    
+async def load_and_join_sessions():
+    """سحب الجلسات، التأكد من انضمامها للكروب، وتحديث القائمة"""
+    global characters_dict
     session_files = list(SESSIONS_DIR.glob("*.session"))
-    print(f"تم العثور على {len(session_files)} ملف جلسة في المجلد.")
 
     for sf in session_files:
         char_id = sf.stem
-        if char_id in clients:
-            continue  # إذا كانت متصلة مسبقاً لا تعيد فتحها لتجنب الـ lock
+        if char_id in characters_dict and char_id in clients:
+            continue
             
         try:
             client = TelegramClient(str(sf), API_ID, API_HASH)
@@ -107,25 +107,26 @@ async def load_all_sessions():
                 me = await client.get_me()
                 name = me.first_name or char_id
                 
+                # محاولة انضمام الحساب للكروب تلقائياً
+                try:
+                    await client(JoinChannelRequest(TARGET_CHANNEL_LINK))
+                    print(f"الحساب {name} انضم إلى الكروب بنجاح.")
+                except Exception as join_err:
+                    print(f"الحساب {name} ربما هو منضم مسبقاً أو حدثت مشكلة بالانضمام: {join_err}")
+
                 clients[char_id] = client
-                # التحقق من عدم تكرار الشخصية في القائمة
-                if not any(c["id"] == char_id for c in characters_list):
-                    characters_list.append({
-                        "id": char_id,
-                        "name": name,
-                        "model": "gpt-4o-mini",
-                        "enabled": True,
-                        "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف."
-                    })
-                print(f"تم تحميل الشخصية بنجاح: {name} (الملف: {sf.name})")
+                characters_dict[char_id] = {
+                    "id": char_id,
+                    "name": name,
+                    "model": "gpt-4o-mini",
+                    "enabled": True,
+                    "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف."
+                }
+                print(f"تم تحميل وتجهيز الشخصية: {name}")
             else:
-                print(f"الجلسة غير صالحة أو منتهية: {sf.name}")
                 await client.disconnect()
         except Exception as e:
             print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
-
-def get_character(char_id: str):
-    return next((c for c in characters_list if c["id"] == char_id and c.get("enabled", True)), None)
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
     key = DEFAULT_KEY
@@ -159,18 +160,14 @@ async def generate_reply(char, shared_memory: str, private_memory: str, recent: 
 async def run_arena():
     turns = 0
     while not stop_event.is_set() and turns < MAX_TURNS:
-        await load_all_sessions()
-        enabled = [c for c in characters_list if c.get("enabled", True) and c["id"] in clients]
+        await load_and_join_sessions()
+        enabled = [c for c in characters_dict.values() if c.get("enabled", True) and c["id"] in clients]
         if len(enabled) < 2:
-            print("العدد غير كافٍ، يرجى التأكد من وجود ملفات جلسات صالحة في مجلد sessions (على الأقل 2)...")
+            print("العدد غير كافٍ، يرجى التأكد من وجود حسابات مفعلة (على الأقل 2)...")
             await asyncio.sleep(5)
             continue
             
-        next_id = store.get_setting("next_character", "") or ""
-        char = get_character(next_id) if next_id else None
-        if not char or char["id"] not in clients:
-            char = random.choice(enabled)
-        store.set_setting("next_character", "")
+        char = random.choice(enabled)
         try:
             recent = store.recent_messages(12)
             shared = store.get_memory("shared")
@@ -197,6 +194,7 @@ async def run_arena():
 async def start_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    await load_and_join_sessions()
     await message.answer(
         "أهلاً بك في لوحة تحكم AI Social Arena 🎭\nاختر أحد الخيارات أدناه للتحكم بالحوار:",
         reply_markup=get_main_keyboard()
@@ -222,8 +220,8 @@ async def callback_handler(callback: CallbackQuery):
         stop_event = asyncio.Event()
         store.set_setting("running", "1")
         engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("بدأت جولة الحوار (جاري سحب الجلسات وبدء السوالف) 🟢", reply_markup=get_main_keyboard())
-        await callback.answer("تم التشغيل")
+        await callback.message.edit_text("جاري انضمام الحسابات للكروب وبدء الحوار... 🟢", reply_markup=get_main_keyboard())
+        await callback.answer("تم التشغيل والانضمام")
 
     elif action == "btn_pause":
         stop_event.set()
@@ -238,33 +236,89 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer("تم الإيقاف")
 
     elif action == "btn_status":
-        await load_all_sessions()
-        connected_count = len(clients)
+        await load_and_join_sessions()
+        enabled_count = len([c for c in characters_dict.values() if c.get("enabled")])
         state = "شغّال 🟢" if engine_task and not engine_task.done() else "متوقف 🔴"
         text = (
             f"📊 **حالة النظام:**\n"
             f"• الحالة: {state}\n"
-            f"• الجلسات المكتشفة: {connected_count}\n"
-            f"• المجموعة: {TARGET_CHAT}\n"
-            f"• الموضوع: {store.get_setting('topic', 'سوالف عامة')}\n"
+            f"• الحسابات المفعلة: {enabled_count} من {len(characters_dict)}\n"
+            f"• الكروب: {TARGET_CHANNEL_LINK}\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
         )
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
         await callback.answer()
 
     elif action == "btn_chars":
-        await load_all_sessions()
-        if not characters_list:
-            text = "👥 **الشخصيات:**\nلم يتم العثور على أي ملف جلسة في مجلد `sessions` بعد."
-        else:
-            lines = [f"• 🟢 {c['name']} (ID: {c['id']})" for c in characters_list]
-            text = "👥 **الشخصيات المتاحة من المجلد:**\n" + "\n".join(lines)
-        await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        await load_and_join_sessions()
+        if not characters_dict:
+            await callback.message.edit_text("👥 **الشخصيات:**\nلم يتم العثور على ملفات جلسات في مجلد `sessions`.", reply_markup=get_main_keyboard())
+            await callback.answer()
+            return
+
+        keyboard_buttons = []
+        for cid, c in characters_dict.items():
+            status_icon = "🟢" if c.get("enabled", True) else "⚪"
+            keyboard_buttons.append([
+                InlineKeyboardButton(text=f"{status_icon} {c['name']}", callback_data=f"toggle_{cid}"),
+                InlineKeyboardButton(text="تبديل الحالة 🔄", callback_data=f"toggle_{cid}")
+            ])
+        
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="تحديد الكل 🟢", callback_data="all_on"),
+            InlineKeyboardButton(text="إلغاء تحديد الكل 🔴", callback_data="all_off")
+        ])
+        keyboard_buttons.append([InlineKeyboardButton(text="العودة للقائمة الرئيسية 🔙", callback_data="back_home")])
+
+        text = "👥 **إدارة حسابات الجلسات (اضغط لتبديل حالة الحساب):**"
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons), parse_mode="Markdown")
         await callback.answer()
 
+@dp.callback_query(F.data.startswith("toggle_") | F.data.in_({"all_on", "all_off", "back_home"}))
+async def chars_management_handler(callback: CallbackQuery):
+    data = callback.data
+    if data == "back_home":
+        await callback.message.edit_text("أهلاً بك في لوحة تحكم AI Social Arena 🎭\nاختر أحد الخيارات أدناه:", reply_markup=get_main_keyboard())
+        await callback.answer()
+        return
+
+    if data == "all_on":
+        for c in characters_dict.values():
+            c["enabled"] = True
+        await callback.answer("تم تفعيل جميع الحسابات ✅", show_alert=True)
+    elif data == "all_off":
+        for c in characters_dict.values():
+            c["enabled"] = False
+        await callback.answer("تم تعطيل جميع الحسابات ❌", show_alert=True)
+    elif data.startswith("toggle_"):
+        cid = data.replace("toggle_", "")
+        if cid in characters_dict:
+            characters_dict[cid]["enabled"] = not characters_dict[cid]["enabled"]
+            state_text = "تم التفعيل 🟢" if characters_dict[cid]["enabled"] else "تم التعطيل ⚪"
+            await callback.answer(state_text)
+
+    keyboard_buttons = []
+    for cid, c in characters_dict.items():
+        status_icon = "🟢" if c.get("enabled", True) else "⚪"
+        keyboard_buttons.append([
+            InlineKeyboardButton(text=f"{status_icon} {c['name']}", callback_data=f"toggle_{cid}"),
+            InlineKeyboardButton(text="تبديل الحالة 🔄", callback_data=f"toggle_{cid}")
+        ])
+    
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="تحديد الكل 🟢", callback_data="all_on"),
+        InlineKeyboardButton(text="إلغاء تحديد الكل 🔴", callback_data="all_off")
+    ])
+    keyboard_buttons.append([InlineKeyboardButton(text="العودة للقائمة الرئيسية 🔙", callback_data="back_home")])
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
+    except Exception:
+        pass
+
 async def main():
-    print("تم بدء تشغيل بوت التحكم، جاري فحص مجلد sessions...")
-    await load_all_sessions()
+    print("تم بدء تشغيل بوت التحكم، جاري فحص مجلد sessions والانضمام للكروب...")
+    await load_and_join_sessions()
     try:
         await dp.start_polling(bot)
     finally:
