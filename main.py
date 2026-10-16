@@ -18,7 +18,9 @@ BASE = Path(__file__).parent
 SESSIONS_DIR = BASE / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
-TMP_SESSIONS_DIR = Path("/tmp/sessions_tmp")
+TMP_SESSIONS_DIR = Path("/tmp/sessions_safe")
+if TMP_SESSIONS_DIR.exists():
+    shutil.rmtree(TMP_SESSIONS_DIR)
 TMP_SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ==================== معلوماتك الشخصية ====================
@@ -104,11 +106,12 @@ async def load_and_join_sessions():
             continue
             
         try:
+            # عزل تام لملف الجلسة لمنع قفل قاعدة البيانات نهائياً
             tmp_sf = TMP_SESSIONS_DIR / sf.name
-            if sf.exists():
+            if sf.exists() and not tmp_sf.exists():
                 shutil.copy(sf, tmp_sf)
 
-            client = TelegramClient(str(tmp_sf).replace(".session", ""), API_ID, API_HASH, connection_retries=3, timeout=10)
+            client = TelegramClient(str(tmp_sf).replace(".session", ""), API_ID, API_HASH, connection_retries=5, timeout=30)
             await client.connect()
             if await client.is_user_authorized():
                 me = await client.get_me()
@@ -133,7 +136,6 @@ async def load_and_join_sessions():
             print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
 
 def call_gemini_smart(prompt: str) -> str:
-    """تجربة الموديلات المجانية بالتسلسل لاختيار الموديل الصحيح تلقائياً"""
     models = ["gemini-pro", "gemini-1.5-flash", "gemini-1.5-pro"]
     headers = {"Content-Type": "application/json"}
     data = {
@@ -143,7 +145,7 @@ def call_gemini_smart(prompt: str) -> str:
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GEMINI_API_KEY}"
         try:
-            response = requests.post(url, json=data, headers=headers, timeout=12)
+            response = requests.post(url, json=data, headers=headers, timeout=15)
             res_json = response.json()
             if "candidates" in res_json and len(res_json["candidates"]) > 0:
                 text = res_json["candidates"][0]["content"]["parts"][0]["text"]
@@ -213,7 +215,7 @@ async def start_cmd(message: Message):
         return
     await load_and_join_sessions()
     await message.answer(
-        "أهلاً بك في لوحة تحكم AI Social Arena (Multi-Model Free) 🎭\nاختر أحد الخيارات أدناه:",
+        "أهلاً بك في لوحة تحكم AI Social Arena (Final Fixed) 🎭\nاختر أحد الخيارات أدناه:",
         reply_markup=get_main_keyboard()
     )
 
@@ -237,7 +239,7 @@ async def callback_handler(callback: CallbackQuery):
         stop_event = asyncio.Event()
         store.set_setting("running", "1")
         engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("جاري انضمام الحسابات وبدء السوالف بأفضل موديل متوفر... 🟢", reply_markup=get_main_keyboard())
+        await callback.message.edit_text("جاري انضمام الحسابات وبدء السوالف بشكل آمن تماماً... 🟢", reply_markup=get_main_keyboard())
         await callback.answer("تم التشغيل والانضمام")
 
     elif action == "btn_pause":
@@ -261,7 +263,7 @@ async def callback_handler(callback: CallbackQuery):
             f"• الحالة: {state}\n"
             f"• الحسابات المفعلة: {enabled_count} من {len(characters_dict)}\n"
             f"• الكروب: {TARGET_CHANNEL_LINK}\n"
-            f"• نظام الموديلات: Multi-Model Free Auto-Switch\n"
+            f"• النظام: آمن تماماً ضد قفل قاعدة البيانات\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
         )
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -335,7 +337,7 @@ async def chars_management_handler(callback: CallbackQuery):
         pass
 
 async def main():
-    print("تم بدء تشغيل بوت التحكم، النظام الذكي للموديلات المجانية جاهز...")
+    print("تم بدء تشغيل بوت التحكم، النظام الآمن للجلسات والاتصال يعمل بكفاءة...")
     await load_and_join_sessions()
     try:
         await dp.start_polling(bot)
