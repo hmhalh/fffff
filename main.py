@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import re
+import shutil
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -16,6 +17,9 @@ BASE = Path(__file__).parent
 
 SESSIONS_DIR = BASE / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
+
+TMP_SESSIONS_DIR = Path("/tmp/sessions_tmp")
+TMP_SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ==================== معلوماتك الشخصية ====================
 CONTROL_TOKEN = "7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8"
@@ -38,8 +42,8 @@ if not CONTROL_TOKEN:
 if not ADMIN_IDS:
     raise SystemExit("يرجى وضع ADMIN_IDS في الكود!")
 
-# إعداد وتهيئة جيميناي حصرياً
 genai.configure(api_key=GEMINI_API_KEY)
+# استخدام النموذج الصحيح المتوافق مع المكتبة
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 class SimpleStore:
@@ -100,11 +104,16 @@ async def load_and_join_sessions():
 
     for sf in session_files:
         char_id = sf.stem
-        if char_id in characters_dict and char_id in clients:
+        if char_id in clients and clients[char_id].is_connected():
             continue
             
         try:
-            client = TelegramClient(str(sf), API_ID, API_HASH)
+            tmp_sf = TMP_SESSIONS_DIR / sf.name
+            # نسخ الملف بطريقة امنة تمنع الـ lock
+            if sf.exists():
+                shutil.copy(sf, tmp_sf)
+
+            client = TelegramClient(str(tmp_sf).replace(".session", ""), API_ID, API_HASH, connection_retries=3, timeout=10)
             await client.connect()
             if await client.is_user_authorized():
                 me = await client.get_me()
@@ -122,7 +131,7 @@ async def load_and_join_sessions():
                     "enabled": True,
                     "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف. ردودك قصيرة (1-4 جمل) وبدون مقدمات أو كتابة اسمك في بداية الرسالة."
                 }
-                print(f"تم تحميل وتجهيز الشخصية: {name}")
+                print(f"تم تحميل وتجهيز الشخصية بنجاح: {name}")
             else:
                 await client.disconnect()
         except Exception as e:
@@ -239,7 +248,7 @@ async def callback_handler(callback: CallbackQuery):
             f"• الحالة: {state}\n"
             f"• الحسابات المفعلة: {enabled_count} من {len(characters_dict)}\n"
             f"• الكروب: {TARGET_CHANNEL_LINK}\n"
-            f"• المحرك: Google Gemini\n"
+            f"• المحرك: Google Gemini (gemini-1.5-flash)\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
         )
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -313,7 +322,7 @@ async def chars_management_handler(callback: CallbackQuery):
         pass
 
 async def main():
-    print("تم بدء تشغيل بوت التحكم، جاري ربط Gemini وفحص مجلد sessions والانضمام للكروب...")
+    print("تم بدء تشغيل بوت التحكم، جاري نسخ الجلسات وربط Gemini بأمان...")
     await load_and_join_sessions()
     try:
         await dp.start_polling(bot)
