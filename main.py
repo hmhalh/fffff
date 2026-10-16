@@ -7,7 +7,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from google import genai
+import google.generativeai as genai
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -25,7 +25,7 @@ TARGET_CHAT = -1004309527352
 TARGET_CHANNEL_LINK = "https://t.me/DialoguesAi"
 ADMIN_IDS = {7199778669}
 
-# مفتاح جيميناي الخاص بك
+# مفتاح Gemini الخاص بك
 GEMINI_API_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
 
 DELAY = 25
@@ -37,6 +37,10 @@ if not CONTROL_TOKEN:
     raise SystemExit("يرجى وضع توكن بوت التحكم في الكود!")
 if not ADMIN_IDS:
     raise SystemExit("يرجى وضع ADMIN_IDS في الكود!")
+
+# إعداد وتهيئة جيميناي حصرياً
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 class SimpleStore:
     def __init__(self):
@@ -74,9 +78,6 @@ clients: dict[str, TelegramClient] = {}
 characters_dict: dict[str, dict] = {}
 engine_task: asyncio.Task | None = None
 stop_event = asyncio.Event()
-
-# تهيئة عميل جيميناي
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -118,9 +119,8 @@ async def load_and_join_sessions():
                 characters_dict[char_id] = {
                     "id": char_id,
                     "name": name,
-                    "model": "gemini-2.5-flash",
                     "enabled": True,
-                    "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف. الرد يكون قصير (1-4 جمل) وبدون مقدمات آلية."
+                    "system_prompt": f"أنت شخص اسمه {name}, تسولف بطريقة عفوية وطبيعية باللهجة العراقية في مجموعة سوالف. ردودك قصيرة (1-4 جمل) وبدون مقدمات أو كتابة اسمك في بداية الرسالة."
                 }
                 print(f"تم تحميل وتجهيز الشخصية: {name}")
             else:
@@ -129,25 +129,22 @@ async def load_and_join_sessions():
             print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
-    current_topic = topic if topic else 'سوالف عامة عن الأنمي والحياة اليومية'
-    priv_mem = private_memory if private_memory else 'ماكو معلومات خاصة بعد'
+    current_topic = topic if topic else 'سوالف عامة'
+    priv_mem = private_memory if private_memory else 'لا توجد'
     shared_mem = shared_memory if shared_memory else 'بداية الحوار'
     
-    prompt_history = f"الموضوع الحالي: {current_topic}\nذاكرتك الخاصة: {priv_mem}\nملخص الحوار المشترك: {shared_mem}\n\nآخر الرسائل في المجموعة:\n"
+    prompt_history = f"الموضوع الحالي: {current_topic}\nذاكرتك الخاصة: {priv_mem}\nملخص الحوار: {shared_mem}\n\nآخر رسائل الكروب:\n"
     for item in recent[-12:]:
-        prompt_history += f"- {item['speaker_name']}: {item['text']}\n"
+        prompt_history += f"{item['speaker_name']}: {item['text']}\n"
         
     full_prompt = (
         f"{char['system_prompt']}\n\n"
         f"{prompt_history}\n"
-        f"اكتب رد الشخصية {char['name']} الآن بشكل طبيعي وباللهجة العراقية كأنك تتكلم في كروب:"
+        f"اكتب رد الشخصية {char['name']} الآن باللهجة العراقية الطبيعية فقط:"
     )
     
     try:
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=full_prompt,
-        )
+        response = await asyncio.to_thread(gemini_model.generate_content, full_prompt)
         text = (response.text or "").strip()
         text = re.sub(r"^(" + char['name'] + r")\s*[:：-]\s*", "", text)
         return text[:MAX_REPLY_CHARS].strip()
@@ -161,7 +158,7 @@ async def run_arena():
         await load_and_join_sessions()
         enabled = [c for c in characters_dict.values() if c.get("enabled", True) and c["id"] in clients]
         if len(enabled) < 2:
-            print("العدد غير كافٍ، يرجى التأكد من وجود حسابات مفعلة (على الأقل 2)...")
+            print("العدد غير كافٍ، يرجى التأكد من تفعيل حسابين على الأقل...")
             await asyncio.sleep(5)
             continue
             
@@ -194,7 +191,7 @@ async def start_cmd(message: Message):
         return
     await load_and_join_sessions()
     await message.answer(
-        "أهلاً بك في لوحة تحكم AI Social Arena (Gemini Edition) 🎭\nاختر أحد الخيارات أدناه للتحكم بالحوار:",
+        "أهلاً بك في لوحة تحكم AI Social Arena (Gemini Pure) 🎭\nاختر أحد الخيارات أدناه:",
         reply_markup=get_main_keyboard()
     )
 
@@ -218,7 +215,7 @@ async def callback_handler(callback: CallbackQuery):
         stop_event = asyncio.Event()
         store.set_setting("running", "1")
         engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("جاري انضمام الحسابات للكروب وبدء الحوار عبر Gemini... 🟢", reply_markup=get_main_keyboard())
+        await callback.message.edit_text("جاري انضمام الحسابات وبدء الحوار بواسطة Gemini... 🟢", reply_markup=get_main_keyboard())
         await callback.answer("تم التشغيل والانضمام")
 
     elif action == "btn_pause":
@@ -242,7 +239,7 @@ async def callback_handler(callback: CallbackQuery):
             f"• الحالة: {state}\n"
             f"• الحسابات المفعلة: {enabled_count} من {len(characters_dict)}\n"
             f"• الكروب: {TARGET_CHANNEL_LINK}\n"
-            f"• النموذج المستخدم: Google Gemini 2.5\n"
+            f"• المحرك: Google Gemini\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
         )
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -316,7 +313,7 @@ async def chars_management_handler(callback: CallbackQuery):
         pass
 
 async def main():
-    print("تم بدء تشغيل بوت التحكم، جاري ربط مفتاح جيميناي وفحص مجلد sessions...")
+    print("تم بدء تشغيل بوت التحكم، جاري ربط Gemini وفحص مجلد sessions والانضمام للكروب...")
     await load_and_join_sessions()
     try:
         await dp.start_polling(bot)
