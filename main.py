@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
+from telethon.tl.functions.messages import ImportChatInviteRequest, GetHistoryRequest
+from telethon.tl.functions.channels import ReadHistoryRequest
 from google import genai
 from telegram import (
     Update,
@@ -134,9 +136,9 @@ def create_character(name):
     actual_name = path.stem
     character = {
         "name": actual_name,
-        "personality": "ودودة، عفوية، وتتكلم باللهجة العراقية الطبيعية.",
-        "speaking_style": "لهجة عراقية بسيطة كالأشخاص الحقيقيين.",
-        "mood": "متوازنة",
+        "personality": "شخص طبيعي جداً، يحب السوالف والعكسات والضحك، يعلق على الكلام بعفوية وبلهجة عراقية دارجة.",
+        "speaking_style": "عراقي عامي طبيعي، عبارات قصيرة، يضحك، يسولف، ويعلق مثل البشر بالجروبات.",
+        "mood": "مرتاح وطبيعي",
         "background": "",
         "messages": [],
     }
@@ -161,13 +163,14 @@ def add_message(character, role, text):
 
 
 # ==================================================
-# الذكاء الاصطناعي (Gemini)
+# الذكاء الاصطناعي (Gemini - سوالف بشرية عفوية)
 # ==================================================
 
-async def generate_reply(character, user_text, sender_name="صديق"):
+async def generate_human_chat(character, user_text, sender_name="صديق"):
+    """توليد رد عراقي بشري طبيعي جداً (تعليق، ضحكة، سالفة، موافقة أو اعتراض)"""
     api_key = settings.get("gemini_api_key", "")
     if not api_key:
-        return "مفتاح Gemini غير مضبوط."
+        return None
 
     client = genai.Client(api_key=api_key)
     history = character.get("messages", [])[-15:]
@@ -177,25 +180,25 @@ async def generate_reply(character, user_text, sender_name="صديق"):
     )
 
     prompt = f"""
-أنت شخصية حقيقية تتحدث داخل مجموعة على تليغرام، ولست مساعداً ذكياً أو بوت.
+أنت إنسان طبيعي حقيقي تتراسل وتتشاتن بجروب تليغرام ويا أصدقائك، مو بوت ولا ذكاء اصطناعي.
 
-اسم الشخصية: {character.get('name', 'شخصية')}
-الصفات: {character.get('personality', '')}
-أسلوب الكلام: {character.get('speaking_style', '')}
-المزاج: {character.get('mood', '')}
+اسمك: {character.get('name', 'شخصية')}
+شخصيتك: {character.get('personality', '')}
+أسلوب كلامك: {character.get('speaking_style', '')}
 
-قواعد أساسية:
-1. لا تقل أبداً أنك ذكاء اصطناعي أو بوت.
-2. تكلم باللهجة العراقية العفوية والبسيطة كإنسان حقيقي.
-3. كن مختصراً وطبيعياً كالمحادثات اليومية.
+تعليمات السوالف البشرية:
+1. اتكلم باللهجة العراقية العامة اليومية العفوية 100% (استخدم كلمات مثل: هلو، هههه، والله، صدك، خطية، لك، يمعود، تمام، الخ).
+2. لا تجاوب أسلوب "سؤال وجواب" رسمي، بل علّق على كلام الشخص، اضحك، أيد كلامه، اختلف وياه، أو احكي موقف أو سالفة بسيطة تج طليعية.
+3. الرد خليه قصير وطبيعي مثل رسائل التليغرام البشرية (من كلمة إلى جملة أو جملتين قصيرة).
+4. لا تقول أبداً إنك بوت أو ذكاء اصطناعي.
 
-سجل المحادثة:
+سجل المحادثة بالجروب:
 {history_text}
 
-رسالة المستخدم ({sender_name}):
+الرسالة الأخيرة من ({sender_name}):
 {user_text}
 
-اكتب ردك العفوي فقط:
+اكتب ردك العفوي الطبيعي فقط:
 """
 
     def call_gemini():
@@ -212,20 +215,19 @@ async def generate_reply(character, user_text, sender_name="صديق"):
         return None
 
 
-async def generate_spontaneous_message(character):
-    """توليد رسالة مبادرة تلقائية من الشخصية لتبدأ الكلام بنفسها"""
+async def generate_spontaneous_topic(character):
+    """توليد سالفة أو تعليق عفوي مفاجئ في الجروب لتنشيط السوالف"""
     api_key = settings.get("gemini_api_key", "")
     if not api_key:
         return None
 
     client = genai.Client(api_key=api_key)
     prompt = f"""
-أنت شخصية حقيقية في مجموعة على تليغرام.
+أنت شخصية حقيقية كاعد بالجروب وتصرف مثل البشر.
 اسمك: {character.get('name', 'شخصية')}
-صفاتك: {character.get('personality', '')}
 أسلوبك: {character.get('speaking_style', '')}
 
-اكتب رسالة قصيرة وعفوية باللهجة العراقية لتبدأ بها حديثاً عاماً أو تطرح موضوعاً خفيفاً في الجروب كبشري حقيقي (مثل سؤال عن الحال، تعليق لطيف، أو فكرة بسيطة). لا تذكر أنك ذكاء اصطناعي أبداً.
+اكتب سالفة قصيرة أو كلمة عفوية باللهجة العراقية تفتح بيها مجال للسوالف بالجروب (مثل: هلا بيهم، شكو ماكو اليوم؟، ضوجة مو؟، شسوون؟، أو تعليق عراقي بسيط).
 النص فقط:
 """
 
@@ -287,8 +289,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.effective_message.reply_text(
-        "🤖 لوحة إدارة الحسابات والشخصيات\n\n"
-        "الحسابات متصلة وتتفاعل تلقائياً عند تفعيل الردود.",
+        "🤖 لوحة إدارة تفاعل الشخصيات الحقيقية والسوالف\n\n"
+        "الحسابات تتصرف وتتكلم باللهجة العراقية العفوية كأشخاص حقيقيين.",
         reply_markup=main_keyboard(),
     )
 
@@ -332,7 +334,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             f"👤 الشخصية: {name}\n"
-            f"الصفات: {character.get('personality', '')}\n"
+            f"الصفات والتفكير: {character.get('personality', '')}\n"
             f"الأسلوب: {character.get('speaking_style', '')}\n"
         )
         keyboard = InlineKeyboardMarkup([
@@ -356,12 +358,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➖ حذف مجموعة", callback_data="remove_group")],
             [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
         ])
-        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}", keyboard)
+        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}\n\n(أرسل المعرّف أو رابط الدعوة هنا)", keyboard)
         return
 
     if action == "add_group":
         pending[user.id] = {"action": "add_group"}
-        await show_page(query, "➕ أرسل معرّف المجموعة أو رابطها (مثلاً -100xxxxxxxxxx):", back_keyboard("groups"))
+        await show_page(query, "➕ أرسل معرّف المجموعة أو رابط الدعوة:", back_keyboard("groups"))
         return
 
     if action == "remove_group":
@@ -389,7 +391,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• الشخصيات: {len(files)}\n"
             f"• الحسابات: {len(sessions)}\n"
             f"• المجموعات: {len(settings['groups'])}\n"
-            f"• الردود: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}"
+            f"• السوالف والتفاعل: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}"
         )
         await show_page(query, text, back_keyboard())
         return
@@ -415,7 +417,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_settings()
         await show_page(
             query,
-            f"حالة الردود أصبحت: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}",
+            f"حالة الردود والسوالف أصبحت: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}",
             main_keyboard(),
         )
 
@@ -454,7 +456,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             settings["groups"].append(text)
         save_settings()
         pending.pop(user.id, None)
-        await message.reply_text(f"✅ تم تسجيل المجموعة {text}.")
+        await message.reply_text(f"✅ تم تسجيل المجموعة أو الرابط {text}.")
         return
 
     if action == "set_key":
@@ -466,8 +468,20 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==================================================
-# تشغيل الحسابات الشخصية (Userbots) والمراسلة التلقائية
+# محاكاة سلوك قراءة ومراقبة الشاشة
 # ==================================================
+
+async def simulate_human_reading(client, entity):
+    """محاكاة قراءة ومتابعة الرسائل كإنسان حقيقي"""
+    try:
+        await client(ReadHistoryRequest(peer=entity))
+        await client(GetHistoryRequest(
+            peer=entity, offset_id=0, offset_date=None, add_offset=0, limit=10, max_id=0, min_id=0, hash=0
+        ))
+        await asyncio.sleep(2)
+    except Exception as e:
+        log.error(f"خطأ أثناء قراءة الشاشة: {e}")
+
 
 async def start_client_session(session_path):
     client = TelegramClient(str(session_path.with_suffix("")), API_ID, API_HASH)
@@ -483,13 +497,21 @@ async def start_client_session(session_path):
         chat_id_str = str(chat.id)
         registered_groups = settings.get("groups", [])
 
-        # التحقق من أن المجموعة مسجلة
-        if registered_groups and chat_id_str not in registered_groups and str(event.chat_id) not in registered_groups:
-            return
+        if registered_groups:
+            matched = False
+            for g in registered_groups:
+                if chat_id_str in g or str(event.chat_id) in g or g in str(chat.id):
+                    matched = True
+                    break
+            if not matched:
+                return
 
         me = await client.get_me()
         if event.sender_id == me.id:
             return
+
+        # مشاهدة وقراءة الرسائل أولاً كإنسان
+        await simulate_human_reading(client, chat)
 
         char_name = me.first_name or "شخصية"
         path, character = find_character(char_name)
@@ -500,32 +522,17 @@ async def start_client_session(session_path):
         if not message_text:
             return
 
-        bot_username = getattr(client, "username", "") or ""
-        reply_to = await event.get_reply_message()
-        is_reply_to_me = reply_to and reply_to.sender_id == me.id
-        is_mentioned = bot_username and f"@{bot_username}".lower() in message_text.lower()
-
-        # الاستجابة عند المنشن أو الرد المباشر أو المحادثة
-        if not is_reply_to_me and not is_mentioned and not message_text.startswith("!ai"):
-            return
-
-        cleaned_text = message_text
-        if bot_username:
-            cleaned_text = cleaned_text.replace(f"@{bot_username}", "").strip()
-        if cleaned_text.startswith("!ai"):
-            cleaned_text = cleaned_text[3:].strip()
-
         sender = await event.get_sender()
         sender_name = getattr(sender, "first_name", "صديق")
 
-        add_message(character, "user", f"{sender_name}: {cleaned_text}")
+        add_message(character, "user", f"{sender_name}: {message_text}")
 
         try:
             async with client.action(chat, 'typing'):
-                await asyncio.sleep(2)
-                reply_text = await generate_reply(character, cleaned_text, sender_name)
+                await asyncio.sleep(2.5)  # محاكاة الكتابة العفوية
+                reply_text = await generate_human_chat(character, message_text, sender_name)
         except Exception:
-            log.exception("خطأ في توليد الرد")
+            log.exception("خطأ في توليد السالفة")
             return
 
         if reply_text:
@@ -538,10 +545,10 @@ async def start_client_session(session_path):
         log.error(f"الجلسة {session_path.name} غير مفعّلة.")
         return None
 
-    # مهمة الخلفية: تجعل الحساب يبادر بالمراسلة تلقائياً في الجروبات كل فترة
+    # مهمة المبادرة بالسوالف والمواضيع بالجروب
     async def spontaneous_chat_task():
         while True:
-            await asyncio.sleep(300) # يرسل رسالة تلقائية كل 5 دقائق (يمكنك تقليلها أو زيادتها)
+            await asyncio.sleep(240)  # كل 4 دقائق سالفة أو تعليق جديد
             if not settings.get("running"):
                 continue
 
@@ -555,27 +562,36 @@ async def start_client_session(session_path):
             if not path or not character:
                 continue
 
-            spontaneous_text = await generate_spontaneous_message(character)
-            if spontaneous_text:
-                for g_id in registered_groups:
-                    try:
-                        # محاولة الانضمام تلقائياً للجروب إذا لم يكن منضمًا
+            for g_item in registered_groups:
+                try:
+                    entity = None
+                    if "t.me/+" in g_item or "t.me/joinchat/" in g_item or "joinchat" in g_item:
+                        hash_code = g_item.split("/")[-1].replace("+", "").split("?")[0]
                         try:
-                            entity = await client.get_entity(int(g_id) if g_id.lstrip("-").isdigit() else g_id)
+                            await client(ImportChatInviteRequest(hash_code))
                         except Exception:
-                            continue
+                            pass
+                        entity = await client.get_entity(g_item)
+                    else:
+                        target = int(g_item) if g_item.lstrip("-").isdigit() else g_item
+                        entity = await client.get_entity(target)
 
-                        async with client.action(entity, 'typing'):
-                            await asyncio.sleep(2)
-                        await client.send_message(entity, spontaneous_text)
-                        add_message(character, "assistant", spontaneous_text)
-                        write_character(path, character)
-                        break # يرسل لجروب واحد عشوائي في كل دورة حتى لا يحدث سبام
-                    except Exception:
-                        continue
+                    if entity:
+                        await simulate_human_reading(client, entity)
+                        spontaneous_text = await generate_spontaneous_topic(character)
+                        if spontaneous_text:
+                            async with client.action(entity, 'typing'):
+                                await asyncio.sleep(3)
+                            await client.send_message(entity, spontaneous_text)
+                            add_message(character, "assistant", spontaneous_text)
+                            write_character(path, character)
+                            log.info("أرسل الحساب سالفة بشرية عفوية بالجروب.")
+                            break
+                except Exception as e:
+                    log.error(f"خطأ في السوالف التلقائية بالجروب {g_item}: {e}")
 
     client.loop.create_task(spontaneous_chat_task())
-    log.info(f"تم تشغيل الحساب والمراسلة التلقائية: {session_path.name}")
+    log.info(f"تم تشغيل السوالف البشرية بنجاح: {session_path.name}")
     return client
 
 
@@ -607,7 +623,7 @@ async def main():
         if c:
             clients.append(c)
 
-    log.info("النظام يعمل بكامل ميزاته وتفاعلاته التلقائية.")
+    log.info("النظام يعمل بكامل طاقته بالسوالف والتفاعل البشري العراقي الطبيعي.")
 
     tasks = [c.run_until_disconnected() for c in clients]
     if tasks:
