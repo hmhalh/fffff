@@ -132,25 +132,27 @@ async def load_and_join_sessions():
         except Exception as e:
             print(f"خطأ في تحميل الجلسة {sf.name}: {e}")
 
-def call_gemini_direct(prompt: str) -> str:
-    """إرسال طلب مباشر لخدمة Gemini بدون مكتبات معقدة"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+def call_gemini_smart(prompt: str) -> str:
+    """تجربة الموديلات المجانية بالتسلسل لاختيار الموديل الصحيح تلقائياً"""
+    models = ["gemini-pro", "gemini-1.5-flash", "gemini-1.5-pro"]
     headers = {"Content-Type": "application/json"}
     data = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
     
-    try:
-        response = requests.post(url, json=data, headers=headers, timeout=15)
-        res_json = response.json()
-        if "candidates" in res_json and len(res_json["candidates"]) > 0:
-            return res_json["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            print("Gemini API Response Error:", res_json)
-            return ""
-    except Exception as e:
-        print(f"Direct Gemini Call Error: {e}")
-        return ""
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            response = requests.post(url, json=data, headers=headers, timeout=12)
+            res_json = response.json()
+            if "candidates" in res_json and len(res_json["candidates"]) > 0:
+                text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                if text:
+                    return text
+        except Exception:
+            continue
+            
+    return ""
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
     current_topic = topic if topic else 'سوالف عامة'
@@ -167,8 +169,7 @@ async def generate_reply(char, shared_memory: str, private_memory: str, recent: 
         f"اكتب رد الشخصية {char['name']} الآن باللهجة العراقية الطبيعية فقط:"
     )
     
-    # تشغيل الطلب في Thread منفصل لكي لا يعطل asyncio
-    raw_text = await asyncio.to_thread(call_gemini_direct, full_prompt)
+    raw_text = await asyncio.to_thread(call_gemini_smart, full_prompt)
     text = raw_text.strip()
     text = re.sub(r"^(" + char['name'] + r")\s*[:：-]\s*", "", text)
     return text[:MAX_REPLY_CHARS].strip()
@@ -212,7 +213,7 @@ async def start_cmd(message: Message):
         return
     await load_and_join_sessions()
     await message.answer(
-        "أهلاً بك في لوحة تحكم AI Social Arena (Gemini Direct) 🎭\nاختر أحد الخيارات أدناه:",
+        "أهلاً بك في لوحة تحكم AI Social Arena (Multi-Model Free) 🎭\nاختر أحد الخيارات أدناه:",
         reply_markup=get_main_keyboard()
     )
 
@@ -236,7 +237,7 @@ async def callback_handler(callback: CallbackQuery):
         stop_event = asyncio.Event()
         store.set_setting("running", "1")
         engine_task = asyncio.create_task(run_arena())
-        await callback.message.edit_text("جاري انضمام الحسابات وبدء الحوار بواسطة Gemini... 🟢", reply_markup=get_main_keyboard())
+        await callback.message.edit_text("جاري انضمام الحسابات وبدء السوالف بأفضل موديل متوفر... 🟢", reply_markup=get_main_keyboard())
         await callback.answer("تم التشغيل والانضمام")
 
     elif action == "btn_pause":
@@ -260,7 +261,7 @@ async def callback_handler(callback: CallbackQuery):
             f"• الحالة: {state}\n"
             f"• الحسابات المفعلة: {enabled_count} من {len(characters_dict)}\n"
             f"• الكروب: {TARGET_CHANNEL_LINK}\n"
-            f"• المحرك: Google Gemini API Direct\n"
+            f"• نظام الموديلات: Multi-Model Free Auto-Switch\n"
             f"• الفاصل الزمني: {DELAY} ثانية"
         )
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -334,7 +335,7 @@ async def chars_management_handler(callback: CallbackQuery):
         pass
 
 async def main():
-    print("تم بدء تشغيل بوت التحكم، جاري فحص الجلسات والاتصال المباشر بـ Gemini...")
+    print("تم بدء تشغيل بوت التحكم، النظام الذكي للموديلات المجانية جاهز...")
     await load_and_join_sessions()
     try:
         await dp.start_polling(bot)
