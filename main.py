@@ -14,8 +14,6 @@ from openai import AsyncOpenAI
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 
-from storage import Store
-
 load_dotenv()
 BASE = Path(__file__).parent
 CONTROL_TOKEN = os.getenv("CONTROL_BOT_TOKEN", "")
@@ -36,15 +34,65 @@ if not API_ID or not API_HASH:
 if not ADMIN_IDS:
     raise SystemExit("ضع ADMIN_IDS داخل .env")
 
-with open(BASE / "characters.json", encoding="utf-8") as f:
-    CHARACTERS = json.load(f)
+# تعريف الشخصيات مع الكلمات المفتاحية المرتبطة بأسمائها في تيليجرام
+CHARACTERS = [
+    {
+        "id": "ali",
+        "name": "علي",
+        "model": "gpt-4o-mini",
+        "api_key_env": "AI_DEFAULT_API_KEY",
+        "enabled": True,
+        "keywords": ["علي", "ali", "حسين", "محمد"],  # الكلمات اللي ممكن تظهر باسم الحساب ولد
+        "gender": "male",
+        "system_prompt": "أنت شخص اسمه علي، تحب الأنمي وتسولف بطريقة طبيعية وعراقية عفوية."
+    },
+    {
+        "id": "zainab",
+        "name": "زينب",
+        "model": "gpt-4o-mini",
+        "api_key_env": "AI_DEFAULT_API_KEY",
+        "enabled": True,
+        "keywords": ["زينب", "zainab", "فاطمة", "fatima", "مريم", "نور"],  # الكلمات اللي ممكن تظهر باسم الحساب بنت
+        "gender": "female",
+        "system_prompt": "أنتِ شخصية اسمها زينب، مهتمة بالنقاشات والمسلسلات وتتحدثين باللهجة العراقية."
+    }
+]
 
-store = Store(str(BASE / "arena.db"))
+# كلاس تخزين داخلي خفيف ومباشر
+class SimpleStore:
+    def __init__(self):
+        self.settings = {"topic": "سوالف عامة عن الأنمي والحياة اليومية", "running": "0", "next_character": ""}
+        self.messages = []
+        self.memories = {"shared": ""}
+
+    def get_setting(self, key, default=""):
+        return self.settings.get(key, default)
+
+    def set_setting(self, key, value):
+        self.settings[key] = value
+
+    def get_memory(self, key):
+        return self.memories.get(key, "")
+
+    def append_memory(self, key, text):
+        if key not in self.memories:
+            self.memories[key] = ""
+        self.memories[key] += "\n" + text
+
+    def add_message(self, speaker_id, speaker_name, text):
+        self.messages.append({"speaker_id": speaker_id, "speaker_name": speaker_name, "text": text})
+
+    def recent_messages(self, limit=12):
+        return self.messages[-limit:]
+
+    def is_duplicate(self, text):
+        return any(m["text"] == text for m in self.messages[-5:])
+
+store = SimpleStore()
 bot = Bot(CONTROL_TOKEN)
 dp = Dispatcher()
 clients: dict[str, TelegramClient] = {}
 engine_task: asyncio.Task | None = None
-forced_next: str | None = None
 stop_event = asyncio.Event()
 
 
@@ -54,12 +102,6 @@ def is_admin(message: Message) -> bool:
 
 def get_character(char_id: str):
     return next((c for c in CHARACTERS if c["id"] == char_id and c.get("enabled", True)), None)
-
-
-def make_client(char):
-    session_path = BASE / char["session"]
-    session_path.parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(str(session_path), API_ID, API_HASH)
 
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
@@ -110,7 +152,6 @@ async def run_arena():
             if not reply or store.is_duplicate(reply):
                 await asyncio.sleep(2)
                 continue
-            # Send as the explicitly configured account; no mass mentions or unsolicited DMs.
             await clients[char["id"]].send_message(TARGET_CHAT, reply)
             store.add_message(char["id"], char["name"], reply)
             store.append_memory(char["id"], f"آخر مساهمة: {reply}")
@@ -118,7 +159,6 @@ async def run_arena():
             turns += 1
             await asyncio.sleep(DELAY)
         except FloodWaitError as e:
-            # Respect Telegram's server-provided cooldown.
             await asyncio.sleep(min(int(e.seconds) + 2, 3600))
         except (RPCError, RuntimeError, Exception) as e:
             print(f"[arena] {char.get('name', '?')}: {type(e).__name__}: {e}")
@@ -226,13 +266,64 @@ async def run_cmd(message: Message):
 
 
 async def main():
+    # البحث عن كل ملفات الجلسات الموجودة في المجلد
+    session_files = list(BASE.glob("*.session"))
+    print(f"تم العثور على ملفات الجلسات: {[f.name for f in session_files]}")
+
+    matched_sessions = set()
+
     for char in CHARACTERS:
         if not char.get("enabled", True):
             continue
-        client = make_client(char)
-        await client.start()
-        clients[char["id"]] = client
-        print(f"Connected: {char['name']}")
+
+        assigned_client = None
+        assigned_file = None
+
+        # خطوة 1: فحص كل ملف جلسة والتحقق من اسم حساب تيليجرام المرتبط به
+        for sf in session_files:
+            if sf in matched_sessions:
+                continue
+            
+            try:
+                temp_client = TelegramClient(str(sf), API_ID, API_HASH)
+                await temp_client.connect()
+                if await temp_client.is_user_authorized():
+                    me = await temp_client.get_me()
+                    full_name = f"{me.first_name or ''} {me.last_name or ''}".lower()
+                    
+                    # التحقق من مطابقة اسم الحساب مع الكلمات المفتاحية للشخصية
+                    matched_by_name = any(kw in full_name for kw in char["keywords"])
+                    
+                    # التحقق من وجود صورة شخصية (إذا لم يتطابق الاسم تماماً، نتحقق من وجود صورة كخيار إضافي)
+                    has_photo = me.photo is not None
+                    
+                    if matched_by_name or (has_photo and char["id"] in sf.stem.lower()):
+                        assigned_client = temp_client
+                        assigned_file = sf
+                        break
+                await temp_client.disconnect()
+            except Exception as e:
+                print(f"خطأ أثناء فحص الملف {sf.name}: {e}")
+
+        # إذا لم يجد تطابقاً دقيقاً بالاسم، يأخذ أول ملف متاح غير مستخدم
+        if not assigned_client and session_files:
+            for sf in session_files:
+                if sf not in matched_sessions:
+                    assigned_file = sf
+                    assigned_client = TelegramClient(str(sf), API_ID, API_HASH)
+                    break
+
+        if assigned_client and assigned_file:
+            matched_sessions.add(assigned_file)
+            if not assigned_client.is_connected():
+                await assigned_client.start()
+            
+            clients[char["id"]] = assigned_client
+            me_info = await assigned_client.get_me()
+            print(f"تم ربط الشخصية ({char['name']}) بحساب تيليجرام: {me_info.first_name} (ملف: {assigned_file.name})")
+        else:
+            print(f"تحذير: لم يتم العثور على حساب كافٍ للشخصية {char['name']}")
+
     try:
         await dp.start_polling(bot)
     finally:
