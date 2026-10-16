@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# بيانات تليغرام (احصل عليها من my.telegram.org)
+# بيانات تليغرام من متغيرات البيئة
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -30,21 +30,17 @@ SESSIONS_DIR = BASE_DIR / "sessions"
 DATA_DIR = BASE_DIR / "data"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
+# إنشاء المجلدات إن لم تكن موجودة
 CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_SETTINGS = {
-    "running": False,
+    "running": True,
     "gemini_api_key": "",
     "active_character": "",
-    "target_groups": [], # المعرفات أو روابط المجموعات المستهدفة
+    "target_groups": [],
 }
-
-
-# ==================================================
-# حفظ وقراءة الإعدادات
-# ==================================================
 
 def load_settings():
     if SETTINGS_FILE.exists():
@@ -62,16 +58,9 @@ settings = load_settings()
 if GEMINI_API_KEY:
     settings["gemini_api_key"] = GEMINI_API_KEY
 
-def save_settings():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = SETTINGS_FILE.with_suffix(".tmp")
-    with temp_file.open("w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-    temp_file.replace(SETTINGS_FILE)
-
 
 # ==================================================
-# إدارة ملفات الشخصيات والسلوكيات المستقلة
+# إدارة ملفات الشخصيات والسلوكيات
 # ==================================================
 
 def character_files():
@@ -91,7 +80,7 @@ def write_character(path, character):
     temp_file.replace(path)
 
 def unique_character_path(name):
-    """ينشئ اسماً فريداً للملف حتى لا يحدث تداخل (مثلاً زهراء، زهراء 2)"""
+    """تجنب تكرار أسماء الشخصيات (مثلاً: زهراء، زهراء 2)"""
     name = " ".join(name.strip().split()).replace("/", "_").replace("\\", "_")
     name = "".join(ch for ch in name if ch.isalnum() or ch in " _-").strip(" .")
     if not name:
@@ -104,16 +93,14 @@ def unique_character_path(name):
         number += 1
     return candidate
 
-def create_character(name, personality="ودودة، هادئة، وتتكلم باللهجة العراقية الطبيعية.", mood="طبيعية ومتوازنة"):
+def create_character(name, personality="ودودة، مرحة، وتتكلم باللهجة العراقية الطبيعية."):
     path = unique_character_path(name)
     actual_name = path.stem
     character = {
         "name": actual_name,
         "personality": personality,
-        "speaking_style": "لهجة عراقية عفوية وبسيطة كالأشخاص الحقيقيين.",
-        "mood": mood,
-        "background": "شخصية تفاعلية طبيعية داخل المجموعات.",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "speaking_style": "لهجة عراقية بسيطة كالأشخاص الحقيقيين.",
+        "mood": "متوازنة وهادئة",
         "messages": [],
     }
     write_character(path, character)
@@ -131,12 +118,11 @@ def add_message(character, role, text):
         "text": text[:4000],
         "time": datetime.now(timezone.utc).isoformat(),
     })
-    # الاحتفاظ بآخر 100 رسالة فقط لسياق المحادثة
     character["messages"] = character["messages"][-100:]
 
 
 # ==================================================
-# محرك الذكاء الاصطناعي (Gemini)
+# الذكاء الاصطناعي (Gemini)
 # ==================================================
 
 async def generate_reply(character, user_text, sender_name="صديق"):
@@ -152,26 +138,25 @@ async def generate_reply(character, user_text, sender_name="صديق"):
     )
 
     prompt = f"""
-أنت شخصية حقيقية تتحدث داخل مجموعة على تليغرام، ولست مساعداً ذكياً أو بوت. ادمج تماماً في الشخصية الموضحة أدناه:
+أنت شخصية حقيقية تتحدث داخل مجموعة على تليغرام، ولست مساعداً ذكياً أو بوت.
 
 اسمك: {character.get('name', 'شخصية')}
-صفاتك المزاجية والنفسية: {character.get('personality', '')}
-طريقة كلامك: {character.get('speaking_style', '')}
-حالتك المزاجية الحالية: {character.get('mood', '')}
+صفاتك: {character.get('personality', '')}
+أسلوب كلامك: {character.get('speaking_style', '')}
+مزاجك: {character.get('mood', '')}
 
-قواعد أساسية للكلام كشخص حقيقي:
-1. لا تقل أبداً "أنا ذكاء اصطناعي" أو "أنا نموذج لغوي"، تصرف كامتداد لشخصيتك الحقيقية تماماً.
-2. استخدم اللهجة العراقية العفوية والبسيطة والملائمة لمزاجك (سواء كنت هادئاً، عصبياً، مرحاً، إلخ).
-3. كن مختصراً وطبيعياً ككتابة البشر (لا تكتب مقالات طويلة إلا إذا طلب منك ذلك).
-4. تفاعل مع كلام الشخص الذي يكلمك بشكل مباشر وبدون تكلف.
+قواعد المهمة:
+1. لا تذكر مطلقاً أنك ذكاء اصطناعي أو بوت.
+2. تكلم باللهجة العراقية العفوية والبسيطة كإنسان حقيقي.
+3. اكتب ردوداً قصيرة وطبيعية كالمحادثات اليومية.
 
-سجل المحادثات السابقة:
+السجل السابق:
 {history_text}
 
-الرسالة الموجهة إليك من ({sender_name}):
+رسالة ({sender_name}):
 {user_text}
 
-اكتب ردك العفوي المباشر فقط:
+اكتب الرد المباشر فقط:
 """
 
     def call_gemini():
@@ -184,64 +169,43 @@ async def generate_reply(character, user_text, sender_name="صديق"):
         result = await asyncio.to_thread(call_gemini)
         return (result.text or "").strip()
     except Exception:
-        log.exception("خطأ في الاتصال بـ Gemini")
+        log.exception("خطأ في توليد الرد من Gemini")
         return None
 
 
 # ==================================================
-# تشغيل حسابات تليغرام (Userbot) عبر Telethon
+# تشغيل الحسابات من مجلد الجلسات (sessions)
 # ==================================================
 
-async def main():
-    if not API_ID or not API_HASH:
-        raise RuntimeError("يجب توفير API_ID و API_HASH الخاصة بحسابات تليغرام.")
-
-    session_name = str(SESSIONS_DIR / "user_account")
-    client = TelegramClient(session_name, API_ID, API_HASH)
+async def start_client_session(session_path):
+    client = TelegramClient(str(session_path.with_suffix("")), API_ID, API_HASH)
 
     @client.on(events.NewMessage(incoming=True))
-    async def handle_group_messages(event):
-        # التحقق مما إذا كان التشغيل مفَعلاً
-        if not settings.get("running"):
-            return
-
-        # التأكد من أن الرسالة في مجموعة أو مجموعة خارقة (Group/Supergroup)
+    async def handler(event):
         if not event.is_group:
             return
 
-        chat = await event.get_chat()
-        chat_id_str = str(chat.id)
-        target_groups = settings.get("target_groups", [])
-
-        # إذا كانت المجموعات محددة، نتحقق أن المجموعة ضمن القائمة المستهدفة
-        if target_groups and chat_id_str not in target_groups and str(chat.chat_id) not in target_groups:
-            return
-
-        # تجنب الرد على الرسائل الصادرة من نفس الحساب
         me = await client.get_me()
         if event.sender_id == me.id:
             return
 
-        active_name = settings.get("active_character", "")
-        if not active_name:
-            return
+        # البحث عن شخصية تطابق اسم الحساب أو استخدام الشخصية الافتراضية
+        char_name = me.first_name or "شخصية"
+        path, character = find_character(char_name)
 
-        path, character = find_character(active_name)
         if not path or not character:
-            return
+            path, character = create_character(char_name)
 
         message_text = (event.raw_text or "").strip()
         if not message_text:
             return
 
-        # تحديد ما إذا كان يجب الرد (مثلاً إذا تم الرد على رسالة الحساب، أو تم ذكر اسمه، أو عشوائياً بنسبة معينة، أو محادثة طبيعية)
         reply_to = await event.get_reply_message()
         is_reply_to_me = reply_to and reply_to.sender_id == me.id
         is_mentioned = me.username and f"@{me.username}".lower() in message_text.lower()
 
-        # يمكنك جعل الحساب يرد بناءً على الرد المباشر، أو المنشن، أو إذا كانت الرسالة موجهة له
+        # الرد عند المنشن أو الرد المباشر على الحساب
         if not is_reply_to_me and not is_mentioned and not message_text.startswith("!ai"):
-            # إذا أردت أن يرد الحساب على بعض الرسائل بشكل عفوي، يمكنك وضع شرط هنا، والاكتفاء بالمنشن والردود حالياً لتجنب الإزعاج
             return
 
         cleaned_text = message_text
@@ -250,34 +214,62 @@ async def main():
         if cleaned_text.startswith("!ai"):
             cleaned_text = cleaned_text[3:].strip()
 
-        if not cleaned_text:
-            cleaned_text = "هلا بيها"
-
         sender = await event.get_sender()
-        sender_name = getattr(sender, "first_name", "شخص")
+        sender_name = getattr(sender, "first_name", "صديق")
 
-        # حفظ رسالة المستخدم في ملف الشخصية
         add_message(character, "user", f"{sender_name}: {cleaned_text}")
 
-        # محاكاة الكتابة لفترة قصيرة لتبدو كإنسان حقيقي يكتب
+        chat = await event.get_chat()
         async with client.action(chat, 'typing'):
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
             reply_text = await generate_reply(character, cleaned_text, sender_name)
 
         if reply_text:
-            # حفظ رد الشخصية في ملفها
             add_message(character, "assistant", reply_text)
             write_character(path, character)
-
-            # إرسال الرد كشخص حقيقي (بالرد على الرسالة أو بشكل مباشر)
             await event.reply(reply_text)
 
-    print("جاري بدء تشغيل حساب تليغرام...")
-    await client.start()
-    print("تم تسجيل الدخول بنجاح والبدء بمراقبة المجموعات.")
+    await client.connect()
+    if not await client.is_user_authorized():
+        log.error(f"الجلسة {session_path.name} غير مفعّلة أو تم تسجيل الخروج منها.")
+        return None
+
+    log.info(f"تم الاتصال بالحساب من الجلسة: {session_path.name}")
+    return client
+
+
+async def main():
+    if not API_ID or not API_HASH:
+        raise RuntimeError("يجب ضبط API_ID و API_HASH في متغيرات البيئة.")
+
+    # البحث عن كل ملفات الجلسات (.session) داخل مجلد sessions
+    session_files = list(SESSIONS_DIR.glob("*.session"))
+
+    if not session_files:
+        log.warning(f"لم يتم العثور على أي ملفات .session داخل المجلد: {SESSIONS_DIR}")
+        log.warning("يرجى رفع ملفات الجلسات الخاصة بك إلى هذا المجلد ثم إعادة تشغيل الاستضافة.")
+        
+        # الانتظار في حلقة تفادياً لتوقف السكربت كلياً
+        while not list(SESSIONS_DIR.glob("*.session")):
+            await asyncio.sleep(10)
+        
+        session_files = list(SESSIONS_DIR.glob("*.session"))
+
+    clients = []
+    for session_file in session_files:
+        c = await start_client_session(session_file)
+        if c:
+            clients.append(c)
+
+    if not clients:
+        log.error("لم يتم تفعيل أي حساب بنجاح.")
+        return
+
+    log.info(f"تم تشغيل {len(clients)} حساب/حسابات بنجاح. جاهز للاستجابة في المجموعات...")
     
-    # إبقاء التشغيل مستمراً
-    await client.run_until_disconnected()
+    # إبقاء التشغيل مستمراً لجميع الحسابات
+    await asyncio.gather(*(c.run_until_disconnected() for c in clients))
+
 
 if __name__ == "__main__":
     asyncio.run(main())
