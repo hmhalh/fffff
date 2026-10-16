@@ -1,57 +1,40 @@
-# AI Social Arena (MVP)
+# Iraqi AI Community — Starter (2 personas)
 
-مشروع تجريبي لإدارة شخصيات حوارية في مجموعة Telegram خاصة. يدعم جلسات Telethon للحسابات التي تملكها، ومحرك حوار متسلسل، وذاكرة SQLite خاصة/مشتركة، وواجهة تحكم بسيطة عبر Bot API.
+A safe starter for a Telegram group with one clearly identified AI bot and two Iraqi-Arabic personas:
+- Ahmed: social, playful, curious.
+- Zahraa: calm, thoughtful, kind.
 
-## مهم قبل التشغيل
-- استخدم فقط حساباتك أنت، وعرّف أعضاء المجموعة بوضوح أن هذه حسابات/شخصيات آلية.
-- لا تستخدمه لإغراق مجموعات عامة أو خداع أشخاص على أنهم بشر حقيقيون.
-- Telethon يعمل بحسابات مستخدمين عبر MTProto، وليس Bot API. أتمتة حسابات المستخدمين قد تكون خاضعة لقيود تيليگرام وقد تسبب تقييد الحساب؛ ابدأ بمجموعة خاصة وبمعدل بطيء.
-- لا ترسل `api_hash` أو توكنات أو ملفات `.session` لأي شخص. ملفات الجلسات تمنح وصولاً للحساب.
-- هذا MVP يترك توليد الردود عبر واجهة OpenAI-compatible. اضبط عنوان المزود ومفتاحه والنموذج في `.env` أو لكل شخصية في `characters.json`.
-- لوحة التحكم محمية بقائمة ADMIN_IDS. لا تضف أوامر إدارية لمجموعة عامة.
+It uses Gemini API, SQLite persistent memory, and aiogram. It does **not** automate Telegram user accounts or use user-session files. A normal Telegram bot cannot send messages as multiple user accounts, and bots generally cannot talk to other bots as if they were users. For that reason, this starter represents personas through one bot.
 
-## المتطلبات
-Python 3.11+
+## Requirements
+- Python 3.11+
+- A Telegram bot token from @BotFather
+- A Gemini API key from Google AI Studio: https://aistudio.google.com/
+- A group where the bot is added. For group message access, configure BotFather privacy mode appropriately; only do this for your own group and tell members it is an AI bot.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
+## Setup
+1. Create a virtual environment:
+   `python -m venv .venv`
+2. Activate it, then install:
+   `pip install -r requirements.txt`
+3. Copy `.env.example` to `.env` and fill in your keys.
+4. Run:
+   `python app.py`
 
-في Termux:
-```bash
-pkg update
-pkg install python
-pip install -r requirements.txt
-cp .env.example .env
-```
+On Windows, use `.venv\\Scripts\\activate`; on Linux:
+`source .venv/bin/activate`
 
-## الإعداد
-1. أنشئ بوت تحكم عبر BotFather وضع التوكن في `CONTROL_BOT_TOKEN`.
-2. ضع `TELEGRAM_API_ID` و`TELEGRAM_API_HASH` من my.telegram.org.
-3. ضع معرّف حسابك الرقمي في `ADMIN_IDS` (قائمة مفصولة بفواصل).
-4. عدّل `characters.json`: كل شخصية لها `name`, `session`, `system_prompt`, `model`, `api_key_env`.
-5. شغّل `python main.py`. أول تشغيل لكل جلسة Telethon قد يطلب رقم الهاتف ورمز التحقق داخل الطرفية. لا تشارك ملفات الجلسات.
-6. أضف الحسابات للمجموعة الخاصة. اجعل `TARGET_CHAT` معرّف المجموعة أو username مناسباً.
-7. ابدأ من لوحة التحكم: `/start`, `/status`, `/run`, `/pause`, `/topic موضوع`, `/next شخصية`, `/help`.
+## How to use
+- Mention the bot or reply to one of its messages to get a response.
+- `/personas` lists the two personas.
+- `/memory` shows a short summary of stored group context.
+- `/forget` clears stored conversational memory for the current chat.
+- `/help` shows commands.
 
-## أوامر لوحة التحكم
-- `/status` حالة المحرك.
-- `/run` تشغيل المحادثة.
-- `/pause` إيقافها.
-- `/topic موضوع` تعيين الموضوع الحالي.
-- `/next اسم` اختيار الشخصية التالية (إن كانت مفعّلة).
-- `/help` المساعدة.
+This starter only replies when mentioned/replied to. It does not spontaneously flood the group. Add more personas in `PERSONAS` in `app.py`. Memory is stored in `community.db` and should be treated as personal data; protect the server and database.
 
-## بنية البيانات
-- `arena.db`: إعدادات الحالة، آخر الرسائل، ذاكرة مشتركة، ذاكرة كل شخصية، وبصمات منع التكرار.
-- `characters.json`: ملفات الشخصيات. لا تضع أسراراً فيه.
-- `sessions/`: ملفات جلسات Telethon الحساسة.
-
-## قيود
-- النموذج المحدد لكل شخصية قد يكون مدفوعاً أو محدوداً حسب مزود الخدمة.
-- هذا الإصدار لا يضمن أن كل نموذج متاح عند كل مزود؛ استخدم أسماء النماذج المدعومة في حسابك.
-- لا توجد خدمة استضافة مضمنة؛ تشغيل Termux يتطلب منع Android من إيقاف التطبيق بالخلفية أو استخدام استضافة مناسبة.
-- أوقف المحرك عند عدم الحاجة. يوجد حد أدنى للفاصل بين الرسائل وحد أقصى للأدوار لكل جلسة تشغيل.
+## Security
+- Never share your Telegram bot token or Gemini API key.
+- Do not upload session files, `.env`, or `community.db` to public repositories.
+- Use HTTPS/network protections, OS updates, and encrypted backups on a VPS.
+- Keep AI personas disclosed as AI-generated characters; don't use them to mislead people into believing they are real people.
