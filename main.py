@@ -9,38 +9,40 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 
-load_dotenv()
 BASE = Path(__file__).parent
-CONTROL_TOKEN = os.getenv("CONTROL_BOT_TOKEN", "")
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-TARGET_CHAT = os.getenv("TARGET_CHAT", "")
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-DELAY = max(10, int(os.getenv("TURN_DELAY_SECONDS", "25")))
-MAX_TURNS = max(1, int(os.getenv("MAX_TURNS_PER_RUN", "20")))
-MAX_REPLY_CHARS = max(100, int(os.getenv("MAX_REPLY_CHARS", "900")))
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
-DEFAULT_KEY = os.getenv("AI_DEFAULT_API_KEY", "")
+
+# ==================== تم دمج معلوماتك هنا بنجاح ====================
+CONTROL_TOKEN = "7838301513:AAEq39qhnjhmWwBwPh-c2_VIRTiJV06Qvn8"
+API_ID = 20400000  # ضع الـ API ID الخاص بك هنا (أرقام فقط)
+API_HASH = "ضع_الـ_API_HASH_هنا"
+TARGET_CHAT = -1004309527352
+ADMIN_IDS = {7199778669}
+
+DEFAULT_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
+AI_BASE_URL = "https://api.openai.com/v1"
+
+DELAY = 25  # الفاصل الزمني بالثواني بين الرسائل
+MAX_TURNS = 20  # حد الرسائل في الجولة الواحدة
+MAX_REPLY_CHARS = 900
+# =========================================================================
 
 if not CONTROL_TOKEN:
-    raise SystemExit("ضع CONTROL_BOT_TOKEN داخل .env")
+    raise SystemExit("يرجى وضع توكن بوت التحكم في الكود!")
 if not API_ID or not API_HASH:
-    raise SystemExit("ضع TELEGRAM_API_ID و TELEGRAM_API_HASH داخل .env")
+    raise SystemExit("يرجى وضع TELEGRAM_API_ID و TELEGRAM_API_HASH في الكود!")
 if not ADMIN_IDS:
-    raise SystemExit("ضع ADMIN_IDS داخل .env")
+    raise SystemExit("يرجى وضع ADMIN_IDS في الكود!")
 
-# تعريف الشخصيات مع ربطها بملفات الجلسات مباشرة بكل بساطة
 CHARACTERS = [
     {
         "id": "ali",
         "name": "علي",
         "model": "gpt-4o-mini",
-        "api_key_env": "AI_DEFAULT_API_KEY",
+        "api_key_env": DEFAULT_KEY,
         "enabled": True,
         "session": "ali.session",  # اسم ملف جلسة علي
         "system_prompt": "أنت شخص اسمه علي، تحب الأنمي وتسولف بطريقة طبيعية وعراقية عفوية."
@@ -49,7 +51,7 @@ CHARACTERS = [
         "id": "zainab",
         "name": "زينب",
         "model": "gpt-4o-mini",
-        "api_key_env": "AI_DEFAULT_API_KEY",
+        "api_key_env": DEFAULT_KEY,
         "enabled": True,
         "session": "zainab.session",  # اسم ملف جلسة زينب
         "system_prompt": "أنتِ شخصية اسمها زينب، مهتمة بالنقاشات والمسلسلات وتتحدثين باللهجة العراقية."
@@ -111,7 +113,7 @@ def get_main_keyboard():
     ])
 
 async def generate_reply(char, shared_memory: str, private_memory: str, recent: list[dict], topic: str) -> str:
-    key = os.getenv(char.get("api_key_env", ""), DEFAULT_KEY)
+    key = DEFAULT_KEY
     if not key:
         raise RuntimeError(f"مفتاح النموذج غير مضبوط للشخصية {char['name']}")
     
@@ -196,7 +198,7 @@ async def callback_handler(callback: CallbackQuery):
 
     if action == "btn_run":
         if not TARGET_CHAT:
-            await callback.answer("اضبط TARGET_CHAT داخل المتغيرات أولاً.", show_alert=True)
+            await callback.answer("يرجى ضبط TARGET_CHAT في الكود أولاً.", show_alert=True)
             return
         if engine_task and not engine_task.done():
             await callback.answer("الحوار يعمل بالفعل 🟢", show_alert=True)
@@ -241,7 +243,6 @@ async def callback_handler(callback: CallbackQuery):
         await callback.answer()
 
 async def main():
-    # ربط ملفات الجلسات مباشرة وبكل سهولة بدون تعقيد
     for char in CHARACTERS:
         if not char.get("enabled", True):
             continue
