@@ -136,8 +136,8 @@ def create_character(name):
     actual_name = path.stem
     character = {
         "name": actual_name,
-        "personality": "شخص طبيعي، يحب السوالف والضحك والعكسات، يتكلم باللهجة العراقية الطبيعية.",
-        "speaking_style": "عراقي عامي، عبارات عفوية، يضحك ويسولف مثل باقي الأعضاء.",
+        "personality": "شخص طبيعي، يحب السوالف والضحك، يتكلم باللهجة العراقية الطبيعية.",
+        "speaking_style": "عراقي عامي، عبارات عفوية، يضحك ويسولف مع الجميع.",
         "mood": "مرتاح وطبيعي",
         "background": "",
         "messages": [],
@@ -179,25 +179,24 @@ async def generate_human_chat(character, user_text, sender_name="صديق"):
     )
 
     prompt = f"""
-أنت إنسان طبيعي حقيقي تتراسل وتتشاتن بجروب تليغرام ويا أصدقائك، مو بوت ولا ذكاء اصطناعي.
+أنت إنسان طبيعي حقيقي تتراسل بجروب تليغرام مع أصدقائك، لست بوت أو ذكاء اصطناعي.
 
 اسمك: {character.get('name', 'شخصية')}
 شخصيتك: {character.get('personality', '')}
 أسلوب كلامك: {character.get('speaking_style', '')}
 
-قواعد السوالف البشرية:
-1. اتكلم باللهجة العراقية العامة اليومية العفوية 100% (استخدم كلمات مثل: هلو، هههه، والله، صدك، يمعود، تمام، الخ).
-2. لا تجاوب أسلوب "سؤال وجواب" رسمي، بل علّق على كلام الشخص، اضحك، أيد كلامه، أو احكي سالفة بسيطة.
-3. الرد خليه قصير وطبيعي مثل رسائل التليغرام البشرية.
-4. لا تقول أبداً إنك بوت أو ذكاء اصطناعي.
+قواعد السوالف:
+1. اتكلم باللهجة العراقية العامة العفوية (استخدم كلمات مثل: هلو، هههه، والله، صدك، يمعود، تمام، الخ).
+2. الرد قصير وطبيعي جداً مثل رسائل التليغرام البشرية.
+3. لا تقل أبداً إنك بوت أو ذكاء اصطناعي.
 
-سجل المحادثة بالجروب:
+سجل المحادثة:
 {history_text}
 
 الرسالة الأخيرة من ({sender_name}):
 {user_text}
 
-اكتب ردك العفوي الطبيعي فقط:
+اكتب ردك المباشر فقط:
 """
 
     def call_gemini():
@@ -223,9 +222,8 @@ async def generate_spontaneous_topic(character):
     prompt = f"""
 أنت شخصية حقيقية بالجروب وتصرف مثل البشر.
 اسمك: {character.get('name', 'شخصية')}
-أسلوبك: {character.get('speaking_style', '')}
 
-اكتب سالفة قصيرة أو كلمة عفوية باللهجة العراقية تفتح بيها مجال للسوالف بالجروب (مثلاً: هلا بيهم، شكو ماكو اليوم؟، ضوجة مو؟، شسوون؟).
+اكتب تحية حارة أو سالفة قصيرة عفوية باللهجة العراقية لتبدأ بها المحادثة (مثلاً: هلو شباب شكو ماكو؟، هلا بيهم، شلونكم اليوم؟).
 النص فقط:
 """
 
@@ -288,7 +286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text(
         "🤖 لوحة إدارة الحسابات والسوالف البشرية\n\n"
-        "ملاحظة مهمة: أضف رابط الجروب (مثل https://t.me/... أو @username) في قائمة المجموعات لتقوم الحسابات بالانضمام تلقائياً.",
+        "أضف رابط الجروب ثم اضغط تشغيل الردود ليبدأ الاتصال والانضمام الفوري.",
         reply_markup=main_keyboard(),
     )
 
@@ -356,12 +354,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➖ حذف مجموعة", callback_data="remove_group")],
             [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
         ])
-        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}\n\n⚠️ يُفضل إضافة رابط الدعوة الخاص بالجروب (مثل https://t.me/+xxx أو @username)", keyboard)
+        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}\n\n⚠️ أرسل رابط الدعوة المباشر للجروب.", keyboard)
         return
 
     if action == "add_group":
         pending[user.id] = {"action": "add_group"}
-        await show_page(query, "➕ أرسل رابط الجروب (مثل https://t.me/joinchat/... أو @groupname):", back_keyboard("groups"))
+        await show_page(query, "➕ أرسل رابط الجروب المباشر (مثل https://t.me/joinchat/... أو @groupname):", back_keyboard("groups"))
         return
 
     if action == "remove_group":
@@ -454,7 +452,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             settings["groups"].append(text)
         save_settings()
         pending.pop(user.id, None)
-        await message.reply_text(f"✅ تم تسجيل المجموعة أو الرابط {text}.")
+        await message.reply_text(f"✅ تم تسجيل المجموعة {text}.")
         return
 
     if action == "set_key":
@@ -466,37 +464,33 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==================================================
-# محاكاة الانضمام وقراءة الرسائل
+# دالة الانضمام الفوري المتسلسل
 # ==================================================
 
-async def join_group_if_needed(client, group_input):
-    """الانضمام التلقائي الذكي للجروب مهما كان نوع الرابط أو المعرف"""
+async def force_join_and_get_entity(client, group_str):
+    group_str = group_str.strip()
     try:
-        # إذا كان رابط دعوة خاص (+ أو joinchat)
-        if "+" in group_input or "joinchat" in group_input:
-            hash_code = group_input.split("/")[-1].replace("+", "").split("?")[0]
+        if "+" in group_str or "joinchat" in group_str or group_str.startswith("+"):
+            raw_hash = group_str.split("/")[-1].replace("+", "").split("?")[0]
             try:
-                await client(ImportChatInviteRequest(hash_code))
-                log.info(f"تم الانضمام للجروب الخاص بنجاح: {group_input}")
+                await client(ImportChatInviteRequest(raw_hash))
+                log.info(f"تم الانضمام للجروب الخاص بنجاح: {group_str}")
             except Exception as e:
-                log.info(f"الحساب منضم مسبقاً أو يتعذر الانضمام: {e}")
-            return await client.get_entity(group_input)
+                log.info(f"ملاحظة الانضمام: {e}")
+            return await client.get_entity(group_str)
         
-        # إذا كان معرف عام (@group) أو معرف رقمي
-        target = int(group_input) if group_input.lstrip("-").isdigit() else group_input
+        clean_target = group_str.replace("https://t.me/", "@") if "t.me/" in group_str else group_str
+        target = int(clean_target) if clean_target.lstrip("-").isdigit() else clean_target
+        
+        entity = await client.get_entity(target)
         try:
-            entity = await client.get_entity(target)
-            try:
-                await client(JoinChannelRequest(entity))
-                log.info(f"تم الانضمام للجروب العام بنجاح.")
-            except Exception:
-                pass
-            return entity
-        except Exception as e:
-            log.error(f"تعذر العثور على الجروب {group_input}: {e}")
-            return None
+            await client(JoinChannelRequest(entity))
+            log.info(f"تم الانضمام بنجاح للجروب العام.")
+        except Exception:
+            pass
+        return entity
     except Exception as e:
-        log.error(f"فشل في الانضمام إلى {group_input}: {e}")
+        log.error(f"تعذر انضمام الحساب إلى الجروب ({group_str}): {e}")
         return None
 
 
@@ -504,16 +498,50 @@ async def simulate_human_reading(client, entity):
     try:
         await client(ReadHistoryRequest(peer=entity))
         await client(GetHistoryRequest(
-            peer=entity, offset_id=0, offset_date=None, add_offset=0, limit=10, max_id=0, min_id=0, hash=0
+            peer=entity, offset_id=0, offset_date=None, add_offset=0, limit=5, max_id=0, min_id=0, hash=0
         ))
         await asyncio.sleep(2)
-    except Exception as e:
-        log.error(f"خطأ أثناء قراءة الرسائل: {e}")
+    except Exception:
+        pass
 
 
-async def start_client_session(session_path):
+async def initialize_client_and_join(session_path):
+    """الخطوة الأساسية: الاتصال بالجلسة أولاً، ثم الانضمام الفوري للجروبات"""
     client = TelegramClient(str(session_path.with_suffix("")), API_ID, API_HASH)
+    
+    await client.connect()
+    if not await client.is_user_authorized():
+        log.error(f"الجلسة {session_path.name} غير مفعّلة أو منتهية.")
+        return None
 
+    me = await client.get_me()
+    log.info(f"تم الاتصال بنجاح بالحساب: {me.first_name} ({session_path.name})")
+
+    # فور الاتصال، نقوم بالانضمام للجروبات المسجلة إذا كانت الردود مفعلة
+    if settings.get("running"):
+        registered_groups = settings.get("groups", [])
+        char_name = me.first_name or "شخصية"
+        path, character = find_character(char_name)
+        if not path or not character:
+            path, character = create_character(char_name)
+
+        for g_item in registered_groups:
+            try:
+                entity = await force_join_and_get_entity(client, g_item)
+                if entity:
+                    await simulate_human_reading(client, entity)
+                    spontaneous_text = await generate_spontaneous_topic(character)
+                    if spontaneous_text:
+                        async with client.action(entity, 'typing'):
+                            await asyncio.sleep(2)
+                        await client.send_message(entity, spontaneous_text)
+                        add_message(character, "assistant", spontaneous_text)
+                        write_character(path, character)
+                        log.info(f"الحساب ({me.first_name}) انضم للجروب وبدأ بالسوالف فوراً!")
+            except Exception as e:
+                log.error(f"خطأ أثناء الانضمام الأولي للجروب {g_item}: {e}")
+
+    # تعريف مستقبل الرسائل للتفاعل المستمر
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
         if not settings.get("running"):
@@ -534,7 +562,6 @@ async def start_client_session(session_path):
             if not matched:
                 return
 
-        me = await client.get_me()
         if event.sender_id == me.id:
             return
 
@@ -556,7 +583,7 @@ async def start_client_session(session_path):
 
         try:
             async with client.action(chat, 'typing'):
-                await asyncio.sleep(3)  # محاكاة كتابة حقيقية
+                await asyncio.sleep(2.5)
                 reply_text = await generate_human_chat(character, message_text, sender_name)
         except Exception:
             log.exception("خطأ في توليد السالفة")
@@ -567,51 +594,6 @@ async def start_client_session(session_path):
             write_character(path, character)
             await event.reply(reply_text)
 
-    await client.connect()
-    if not await client.is_user_authorized():
-        log.error(f"الجلسة {session_path.name} غير مفعّلة.")
-        return None
-
-    # حلقة الانضمام والمراسلة التلقائية
-    async def spontaneous_chat_task():
-        while True:
-            await asyncio.sleep(60)  # الفحص والانضمام كل دقيقة
-            if not settings.get("running"):
-                continue
-
-            registered_groups = settings.get("groups", [])
-            if not registered_groups:
-                continue
-
-            me = await client.get_me()
-            char_name = me.first_name or "شخصية"
-            path, character = find_character(char_name)
-            if not path or not character:
-                continue
-
-            for g_item in registered_groups:
-                try:
-                    # 1. الانضمام الذكي للجروب
-                    entity = await join_group_if_needed(client, g_item)
-                    if entity:
-                        # 2. قراءة الرسائل كبشري
-                        await simulate_human_reading(client, entity)
-
-                        # 3. إرسال السالفة التلقائية
-                        spontaneous_text = await generate_spontaneous_topic(character)
-                        if spontaneous_text:
-                            async with client.action(entity, 'typing'):
-                                await asyncio.sleep(3)
-                            await client.send_message(entity, spontaneous_text)
-                            add_message(character, "assistant", spontaneous_text)
-                            write_character(path, character)
-                            log.info(f"أرسل الحساب ({me.first_name}) سالفة بشرية بالجروب بنجاح.")
-                            break
-                except Exception as e:
-                    log.error(f"خطأ أثناء السوالف بالجروب {g_item}: {e}")
-
-    client.loop.create_task(spontaneous_chat_task())
-    log.info(f"تم تشغيل الحساب والتأكد من انضمامه وسوالفه: {session_path.name}")
     return client
 
 
@@ -636,14 +618,16 @@ async def main():
     await bot_app.updater.start_polling(drop_pending_updates=False)
     log.info("بدأ تشغيل بوت الإدارة.")
 
+    # 1. انتظار جلسات تليغرام واتصالها أولاً
     session_files = list(SESSIONS_DIR.glob("*.session"))
     clients = []
+    
     for sf in session_files:
-        c = await start_client_session(sf)
+        c = await initialize_client_and_join(sf)
         if c:
             clients.append(c)
 
-    log.info("النظام يعمل بكامل ميزاته وانضمامه التلقائي.")
+    log.info("تم اتصال كافة الجلسات وانضمامها بنجاح.")
 
     tasks = [c.run_until_disconnected() for c in clients]
     if tasks:
