@@ -1,641 +1,248 @@
-import os
-import json
-import asyncio
-import logging
-from pathlib import Path
-from datetime import datetime, timezone
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Single-file Telegram + Gemini group assistant. Python 3.10+, no pip packages required."""
+import os, json, time, urllib.request, urllib.parse, urllib.error, threading
 
-from telethon import TelegramClient, events
-from telethon.tl.functions.messages import ImportChatInviteRequest, GetHistoryRequest
-from telethon.tl.functions.channels import ReadHistoryRequest, JoinChannelRequest
-from google import genai
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "أنت مساعد ذكاء اصطناعي ودود يتحدث باللهجة العراقية بشكل طبيعي ومحترم. أجب باختصار وبحسب سياق المحادثة. وضّح أنك مساعد ذكاء اصطناعي إذا سُئلت عن هويتك. لا تدّعِ أنك إنسان حقيقي."
 )
 
-# ==================================================
-# إعدادات أساسية
-# ==================================================
+if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
+    raise SystemExit("لازم تضيف BOT_TOKEN و GEMINI_API_KEY و ADMIN_ID في Environment Variables بالاستضافة.")
+try:
+    ADMIN_ID = int(ADMIN_ID)
+except ValueError:
+    raise SystemExit("ADMIN_ID لازم يكون رقم تيليجرام الرقمي مالك.")
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-BASE_DIR = Path(os.getenv("DATA_DIR", "/app/storage"))
-CHARACTERS_DIR = BASE_DIR / "characters"
-SESSIONS_DIR = BASE_DIR / "sessions"
-DATA_DIR = BASE_DIR / "data"
-SETTINGS_FILE = DATA_DIR / "settings.json"
-
-CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_SETTINGS = {
-    "admins": [],
-    "groups": [],
-    "running": False,
-    "active_character": "",
-    "gemini_api_key": "",
-}
-
-pending = {}
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(GEMINI_MODEL, safe='')}:generateContent"
+STATE = {"enabled": False, "group_id": None, "group_title": "غير محددة", "offset": 0}
+HISTORY = {}  # in-memory chat context; clears when the process restarts
+LOCK = threading.Lock()
 
 
-def load_settings():
-    if SETTINGS_FILE.exists():
-        try:
-            with SETTINGS_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            for key, value in DEFAULT_SETTINGS.items():
-                data.setdefault(key, value)
-            return data
-        except (OSError, json.JSONDecodeError):
-            log.exception("تعذرت قراءة الإعدادات")
-    return DEFAULT_SETTINGS.copy()
+def http_json(url, payload=None, headers=None, timeout=45):
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method="GET" if data is None else "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {e.code}: {detail[:700]}") from e
 
 
-settings = load_settings()
+def tg(method, payload=None):
+    result = http_json(TG_API + method, payload, {"Content-Type": "application/json"}, timeout=50)
+    if not result.get("ok"):
+        raise RuntimeError(str(result))
+    return result.get("result")
 
-if GEMINI_API_KEY:
-    settings["gemini_api_key"] = GEMINI_API_KEY
+
+def send(chat_id, text, reply_markup=None, reply_to=None):
+    # Telegram message limit is 4096 chars; leave margin.
+    text = str(text or "")
+    chunks = [text[i:i+3900] for i in range(0, len(text), 3900)] or [" "]
+    for i, chunk in enumerate(chunks):
+        body = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        if i == 0 and reply_markup:
+            body["reply_markup"] = reply_markup
+        if i == 0 and reply_to:
+            body["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        tg("sendMessage", body)
 
 
-def save_settings():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = SETTINGS_FILE.with_suffix(".tmp")
-    with temp_file.open("w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-    temp_file.replace(SETTINGS_FILE)
+def keyboard():
+    return {"inline_keyboard": [
+        [{"text": "▶️ تشغيل الردود", "callback_data": "on"}, {"text": "⏸ إيقاف الردود", "callback_data": "off"}],
+        [{"text": "📊 الحالة", "callback_data": "status"}, {"text": "ℹ️ المساعدة", "callback_data": "help"}],
+    ]}
+
+
+def status_text():
+    return (f"الحالة: {'🟢 شغّال' if STATE['enabled'] else '🔴 متوقف'}\n"
+            f"المجموعة: {STATE['group_title']}\n"
+            f"الموديل: {GEMINI_MODEL}\n\n"
+            "للرد بالمجموعة: منشن البوت أو ردّ على رسالة منه، أو استخدم /ask نص السؤال.")
 
 
 def is_admin(user_id):
-    return (
-        user_id == OWNER_ID
-        or user_id in settings.get("admins", [])
-    )
+    return user_id == ADMIN_ID
 
 
-# ==================================================
-# إدارة ملفات الشخصيات
-# ==================================================
-
-def character_files():
-    return sorted(CHARACTERS_DIR.glob("*.json"), key=lambda p: p.name.casefold())
-
-
-def read_character(path):
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def write_character(path, character):
-    temp_file = path.with_suffix(".tmp")
-    with temp_file.open("w", encoding="utf-8") as f:
-        json.dump(character, f, ensure_ascii=False, indent=2)
-    temp_file.replace(path)
-
-
-def unique_character_path(name):
-    name = " ".join(name.strip().split()).replace("/", "_").replace("\\", "_")
-    name = "".join(ch for ch in name if ch.isalnum() or ch in " _-").strip(" .")
-    if not name:
-        name = "شخصية جديدة"
-
-    candidate = CHARACTERS_DIR / f"{name}.json"
-    number = 2
-    while candidate.exists():
-        candidate = CHARACTERS_DIR / f"{name} {number}.json"
-        number += 1
-    return candidate
-
-
-def create_character(name):
-    path = unique_character_path(name)
-    actual_name = path.stem
-    character = {
-        "name": actual_name,
-        "personality": "شخص طبيعي، يحب السوالف والضحك، يتكلم باللهجة العراقية الطبيعية.",
-        "speaking_style": "عراقي عامي، عبارات عفوية، يضحك ويسولف مع الجميع.",
-        "mood": "مرتاح وطبيعي",
-        "background": "",
-        "messages": [],
+def gemini_reply(chat_id, prompt, user_name="عضو"):
+    history = HISTORY.get(chat_id, [])[-12:]
+    contents = []
+    for item in history:
+        contents.append({"role": item["role"], "parts": [{"text": item["text"]}]})
+    contents.append({"role": "user", "parts": [{"text": f"رسالة من {user_name}: {prompt[:5000]}"}]})
+    payload = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 700}
     }
-    write_character(path, character)
-    return path, character
-
-
-def find_character(name):
-    for path in character_files():
-        if path.stem == name:
-            return path, read_character(path)
-    return None, None
-
-
-def add_message(character, role, text):
-    character.setdefault("messages", []).append({
-        "role": role,
-        "text": text[:4000],
-        "time": datetime.now(timezone.utc).isoformat(),
+    result = http_json(GEMINI_URL, payload, {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
     })
-    character["messages"] = character["messages"][-100:]
+    candidates = result.get("candidates", [])
+    if not candidates:
+        feedback = result.get("promptFeedback", {})
+        raise RuntimeError("Gemini لم يرجع إجابة. " + json.dumps(feedback, ensure_ascii=False)[:300])
+    parts = candidates[0].get("content", {}).get("parts", [])
+    answer = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+    if not answer.strip():
+        raise RuntimeError("الموديل رجّع إجابة فارغة.")
+    HISTORY[chat_id] = (history + [
+        {"role": "user", "text": f"رسالة من {user_name}: {prompt[:5000]}"},
+        {"role": "model", "text": answer[:6000]}
+    ])[-12:]
+    return answer.strip()
 
 
-# ==================================================
-# الذكاء الاصطناعي (Gemini)
-# ==================================================
+def handle_message(message):
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    chat_type = chat.get("type")
+    user = message.get("from", {})
+    user_id = user.get("id")
+    text = (message.get("text") or "").strip()
+    if not text or not chat_id or user.get("is_bot"):
+        return
+    first = user.get("first_name", "صديق")
+    lower = text.lower()
+    command = text.split()[0].split("@")[0] if text.startswith("/") else ""
 
-async def generate_human_chat(character, user_text, sender_name="صديق"):
-    api_key = settings.get("gemini_api_key", "")
-    if not api_key:
-        return None
-
-    client = genai.Client(api_key=api_key)
-    history = character.get("messages", [])[-15:]
-    history_text = "\n".join(
-        f"{'أنت' if m['role'] == 'assistant' else m.get('sender', 'مستخدم')}: {m['text']}"
-        for m in history
-    )
-
-    prompt = f"""
-أنت إنسان طبيعي حقيقي تتراسل بجروب تليغرام مع أصدقائك، لست بوت أو ذكاء اصطناعي.
-
-اسمك: {character.get('name', 'شخصية')}
-شخصيتك: {character.get('personality', '')}
-أسلوب كلامك: {character.get('speaking_style', '')}
-
-قواعد السوالف:
-1. اتكلم باللهجة العراقية العامة العفوية (استخدم كلمات مثل: هلو، هههه، والله، صدك، يمعود، تمام، الخ).
-2. الرد قصير وطبيعي جداً مثل رسائل التليغرام البشرية.
-3. لا تقل أبداً إنك بوت أو ذكاء اصطناعي.
-
-سجل المحادثة:
-{history_text}
-
-الرسالة الأخيرة من ({sender_name}):
-{user_text}
-
-اكتب ردك المباشر فقط:
-"""
-
-    def call_gemini():
-        return client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-
-    try:
-        result = await asyncio.to_thread(call_gemini)
-        return (result.text or "").strip()
-    except Exception:
-        log.exception("خطأ في الاتصال بـ Gemini")
-        return None
-
-
-async def generate_spontaneous_topic(character):
-    api_key = settings.get("gemini_api_key", "")
-    if not api_key:
-        return None
-
-    client = genai.Client(api_key=api_key)
-    prompt = f"""
-أنت شخصية حقيقية بالجروب وتصرف مثل البشر.
-اسمك: {character.get('name', 'شخصية')}
-
-اكتب تحية حارة أو سالفة قصيرة عفوية باللهجة العراقية لتبدأ بها المحادثة (مثلاً: هلو شباب شكو ماكو؟، هلا بيهم، شلونكم اليوم؟).
-النص فقط:
-"""
-
-    def call_gemini():
-        return client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-
-    try:
-        result = await asyncio.to_thread(call_gemini)
-        return (result.text or "").strip()
-    except Exception:
-        return None
-
-
-# ==================================================
-# لوحة الإدارة (البوت الرسمي)
-# ==================================================
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👥 الشخصيات", callback_data="characters"),
-            InlineKeyboardButton("➕ إنشاء شخصية", callback_data="new_character"),
-        ],
-        [
-            InlineKeyboardButton("💬 المجموعات", callback_data="groups"),
-            InlineKeyboardButton("📊 الإحصائيات", callback_data="stats"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
-            InlineKeyboardButton(
-                "▶️ تشغيل الردود" if not settings["running"] else "⏹ إيقاف الردود",
-                callback_data="toggle",
-            ),
-        ],
-    ])
-
-
-def back_keyboard(destination="menu"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data=destination)]])
-
-
-async def show_page(query, text, keyboard=None):
-    try:
-        await query.edit_message_text(text=text, reply_markup=keyboard)
-    except Exception:
+    if command == "/start" and chat_type == "private":
+        if not is_admin(user_id):
+            send(chat_id, "هذا بوت خاص بمديره فقط.")
+            return
+        send(chat_id, "أهلاً! هاي لوحة التحكم. أضف البوت للمجموعة، وخلي عنده صلاحية إرسال الرسائل وقراءة الرسائل المطلوبة، ثم اكتب /setgroup داخل المجموعة.", keyboard())
+        return
+    if command in ("/help", "/start"):
+        if chat_type == "private" and not is_admin(user_id):
+            send(chat_id, "هذا بوت خاص بمديره فقط.")
+            return
+        send(chat_id, "الأوامر:\n/setgroup — تعيين المجموعة (داخل المجموعة)\n/ask نص — سؤال مباشر\n/status — الحالة\n/on — تشغيل الردود\n/off — إيقاف الردود\n\nيرد البوت بالمجموعة عند منشنه أو الرد على رسالته أو استخدام /ask.", keyboard() if chat_type == "private" else None)
+        return
+    if command == "/setgroup":
+        if not is_admin(user_id):
+            send(chat_id, "هذا الأمر للمدير فقط.")
+            return
+        if chat_type not in ("group", "supergroup"):
+            send(chat_id, "اكتب /setgroup داخل المجموعة المراد ربطها.")
+            return
+        STATE["group_id"] = chat_id
+        STATE["group_title"] = chat.get("title", str(chat_id))
+        send(chat_id, "✅ تم تعيين هذه المجموعة. ارجع للخاص واضغط تشغيل الردود.")
+        return
+    if command in ("/on", "/off", "/status"):
+        if not is_admin(user_id):
+            send(chat_id, "هذا الأمر للمدير فقط.")
+            return
+        if command == "/on": STATE["enabled"] = True
+        elif command == "/off": STATE["enabled"] = False
+        send(chat_id, status_text(), keyboard() if chat_type == "private" else None)
+        return
+    if command == "/ask":
+        if chat_type == "private" and not is_admin(user_id):
+            send(chat_id, "هذا البوت خاص بمديره فقط.")
+            return
+        prompt = text.partition(" ")[2].strip()
+        if not prompt:
+            send(chat_id, "اكتب سؤالك بعد الأمر، مثال: /ask شلونك؟")
+            return
+        if chat_type != "private" and STATE["group_id"] != chat_id:
+            send(chat_id, "هذه المجموعة مو محددة للمساعد. المدير يكتب /setgroup هنا أولاً.")
+            return
         try:
-            await query.message.reply_text(text=text, reply_markup=keyboard)
-        except Exception:
-            log.exception("تعذر عرض الصفحة")
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text("هذه اللوحة مخصصة للمشرفين.")
+            send(chat_id, gemini_reply(str(chat_id), prompt, first), reply_to=message.get("message_id"))
+        except Exception as e:
+            send(chat_id, "صار خطأ بالاتصال بموديل الذكاء الاصطناعي. راجع إعداد GEMINI_MODEL ومفتاح API.\n" + str(e)[:500])
         return
 
-    await update.effective_message.reply_text(
-        "🤖 لوحة إدارة الحسابات والسوالف البشرية\n\n"
-        "أضف رابط الجروب ثم اضغط تشغيل الردود ليبدأ الاتصال والانضمام الفوري.",
-        reply_markup=main_keyboard(),
-    )
-
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await query.answer("غير مصرح لك.", show_alert=True)
+    # Respond only in the explicitly selected group and only when addressed.
+    if chat_type not in ("group", "supergroup") or chat_id != STATE["group_id"] or not STATE["enabled"]:
         return
-
-    action = query.data
-
-    if action == "menu":
-        await show_page(query, "🤖 لوحة الإدارة الرئيسية", main_keyboard())
+    bot_username = os.getenv("BOT_USERNAME", "").strip().lstrip("@").lower()
+    entities = message.get("entities", [])
+    mentioned = bool(bot_username and f"@{bot_username}" in lower)
+    replied_to_bot = False
+    reply = message.get("reply_to_message") or {}
+    if reply.get("from", {}).get("is_bot"):
+        # Best effort: reply must point to this bot, not any other bot.
+        me = os.getenv("BOT_ID", "").strip()
+        replied_to_bot = bool(me and str(reply.get("from", {}).get("id")) == me)
+        if not me:
+            replied_to_bot = bool(bot_username and reply.get("from", {}).get("username", "").lower() == bot_username)
+    if not (mentioned or replied_to_bot):
         return
-
-    if action == "characters":
-        files = character_files()
-        if not files:
-            await show_page(query, "ماكو شخصيات محفوظة حالياً.", back_keyboard())
-            return
-        buttons = [[InlineKeyboardButton(f"👤 {path.stem}", callback_data=f"char:{path.stem}")] for path in files[:40]]
-        buttons.append([InlineKeyboardButton("⬅️ رجوع", callback_data="menu")])
-        await show_page(query, f"👥 الشخصيات المحفوظة: {len(files)}", InlineKeyboardMarkup(buttons))
-        return
-
-    if action == "new_character":
-        pending[user.id] = {"action": "new_character"}
-        await show_page(query, "➕ أرسل اسم الشخصية الجديدة برسالة:", back_keyboard())
-        return
-
-    if action.startswith("char:"):
-        name = action.split(":", 1)[1]
-        path, character = find_character(name)
-        if not path or not character:
-            await show_page(query, "الملف غير موجود.", back_keyboard("characters"))
-            return
-
-        text = (
-            f"👤 الشخصية: {name}\n"
-            f"الصفات والتفكير: {character.get('personality', '')}\n"
-            f"الأسلوب: {character.get('speaking_style', '')}\n"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ تعديل الصفات", callback_data=f"edit:{name}")],
-            [InlineKeyboardButton("⬅️ رجوع", callback_data="characters")],
-        ])
-        await show_page(query, text, keyboard)
-        return
-
-    if action.startswith("edit:"):
-        name = action.split(":", 1)[1]
-        pending[user.id] = {"action": "edit_character", "name": name}
-        await show_page(query, f"✏️ أرسل الصفات الجديدة لشخصية {name}:", back_keyboard())
-        return
-
-    if action == "groups":
-        groups = settings.get("groups", [])
-        group_text = "\n".join(f"• {g}" for g in groups) or "لا توجد مجموعات."
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ إضافة مجموعة", callback_data="add_group")],
-            [InlineKeyboardButton("➖ حذف مجموعة", callback_data="remove_group")],
-            [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
-        ])
-        await show_page(query, f"💬 المجموعات المسجلة:\n\n{group_text}\n\n⚠️ أرسل رابط الدعوة المباشر للجروب.", keyboard)
-        return
-
-    if action == "add_group":
-        pending[user.id] = {"action": "add_group"}
-        await show_page(query, "➕ أرسل رابط الجروب المباشر (مثل https://t.me/joinchat/... أو @groupname):", back_keyboard("groups"))
-        return
-
-    if action == "remove_group":
-        groups = settings.get("groups", [])
-        if not groups:
-            await show_page(query, "ماكو مجموعات للحذف.", back_keyboard("groups"))
-            return
-        buttons = [[InlineKeyboardButton(f"🗑 {g}", callback_data=f"delgroup:{g}")] for g in groups[:40]]
-        buttons.append([InlineKeyboardButton("⬅️ رجوع", callback_data="groups")])
-        await show_page(query, "اختر المجموعة للحذف:", InlineKeyboardMarkup(buttons))
-        return
-
-    if action.startswith("delgroup:"):
-        group_id = action.split(":", 1)[1]
-        settings["groups"] = [g for g in settings.get("groups", []) if g != group_id]
-        save_settings()
-        await show_page(query, "تم حذف المجموعة.", back_keyboard("groups"))
-        return
-
-    if action == "stats":
-        files = character_files()
-        sessions = list(SESSIONS_DIR.glob("*.session"))
-        text = (
-            f"📊 الإحصائيات:\n"
-            f"• الشخصيات: {len(files)}\n"
-            f"• الحسابات: {len(sessions)}\n"
-            f"• المجموعات: {len(settings['groups'])}\n"
-            f"• حالة التفاعل: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}"
-        )
-        await show_page(query, text, back_keyboard())
-        return
-
-    if action == "settings":
-        await show_page(
-            query,
-            "⚙️ الإعدادات:",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 تغيير مفتاح Gemini", callback_data="set_key")],
-                [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
-            ]),
-        )
-        return
-
-    if action == "set_key":
-        pending[user.id] = {"action": "set_key"}
-        await show_page(query, "أرسل مفتاح Gemini الجديد:", back_keyboard("settings"))
-        return
-
-    if action == "toggle":
-        settings["running"] = not settings["running"]
-        save_settings()
-        await show_page(
-            query,
-            f"حالة الردود أصبحت: {'مفعلة ✅' if settings['running'] else 'متوقفة ⏸️'}",
-            main_keyboard(),
-        )
-
-
-async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-    if not user or not message or not is_admin(user.id):
-        return
-
-    task = pending.get(user.id)
-    if not task:
-        return
-
-    action = task["action"]
-    text = (message.text or "").strip()
-
-    if action == "new_character":
-        path, character = create_character(text)
-        pending.pop(user.id, None)
-        await message.reply_text(f"✅ تم إنشاء شخصية {character['name']} بنجاح.")
-        return
-
-    if action == "edit_character":
-        name = task["name"]
-        path, character = find_character(name)
-        if path and character:
-            character["personality"] = text
-            write_character(path, character)
-        pending.pop(user.id, None)
-        await message.reply_text(f"✅ تم تحديث صفات {name}.")
-        return
-
-    if action == "add_group":
-        if text not in settings["groups"]:
-            settings["groups"].append(text)
-        save_settings()
-        pending.pop(user.id, None)
-        await message.reply_text(f"✅ تم تسجيل المجموعة {text}.")
-        return
-
-    if action == "set_key":
-        settings["gemini_api_key"] = text
-        save_settings()
-        pending.pop(user.id, None)
-        await message.reply_text("✅ تم حفظ مفتاح Gemini.")
-        return
-
-
-# ==================================================
-# دالة الانضمام الفوري المتسلسل
-# ==================================================
-
-async def force_join_and_get_entity(client, group_str):
-    group_str = group_str.strip()
+    prompt = text
+    if bot_username:
+        prompt = prompt.replace("@" + bot_username, "").strip()
+    if not prompt:
+        prompt = "رد على رسالتي بشكل طبيعي باللهجة العراقية."
     try:
-        if "+" in group_str or "joinchat" in group_str or group_str.startswith("+"):
-            raw_hash = group_str.split("/")[-1].replace("+", "").split("?")[0]
-            try:
-                await client(ImportChatInviteRequest(raw_hash))
-                log.info(f"تم الانضمام للجروب الخاص بنجاح: {group_str}")
-            except Exception as e:
-                log.info(f"ملاحظة الانضمام: {e}")
-            return await client.get_entity(group_str)
-        
-        clean_target = group_str.replace("https://t.me/", "@") if "t.me/" in group_str else group_str
-        target = int(clean_target) if clean_target.lstrip("-").isdigit() else clean_target
-        
-        entity = await client.get_entity(target)
-        try:
-            await client(JoinChannelRequest(entity))
-            log.info(f"تم الانضمام بنجاح للجروب العام.")
-        except Exception:
-            pass
-        return entity
+        answer = gemini_reply(str(chat_id), prompt, first)
+        send(chat_id, answer, reply_to=message.get("message_id"))
     except Exception as e:
-        log.error(f"تعذر انضمام الحساب إلى الجروب ({group_str}): {e}")
-        return None
+        send(chat_id, "ما كدرت أجيب رد هسه؛ تأكد من مفتاح Gemini واسم الموديل.\n" + str(e)[:350], reply_to=message.get("message_id"))
 
 
-async def simulate_human_reading(client, entity):
-    try:
-        await client(ReadHistoryRequest(peer=entity))
-        await client(GetHistoryRequest(
-            peer=entity, offset_id=0, offset_date=None, add_offset=0, limit=5, max_id=0, min_id=0, hash=0
-        ))
-        await asyncio.sleep(2)
-    except Exception:
-        pass
-
-
-async def initialize_client_and_join(session_path):
-    """الخطوة الأساسية: الاتصال بالجلسة أولاً، ثم الانضمام الفوري للجروبات"""
-    client = TelegramClient(str(session_path.with_suffix("")), API_ID, API_HASH)
-    
-    await client.connect()
-    if not await client.is_user_authorized():
-        log.error(f"الجلسة {session_path.name} غير مفعّلة أو منتهية.")
-        return None
-
-    me = await client.get_me()
-    log.info(f"تم الاتصال بنجاح بالحساب: {me.first_name} ({session_path.name})")
-
-    # فور الاتصال، نقوم بالانضمام للجروبات المسجلة إذا كانت الردود مفعلة
-    if settings.get("running"):
-        registered_groups = settings.get("groups", [])
-        char_name = me.first_name or "شخصية"
-        path, character = find_character(char_name)
-        if not path or not character:
-            path, character = create_character(char_name)
-
-        for g_item in registered_groups:
-            try:
-                entity = await force_join_and_get_entity(client, g_item)
-                if entity:
-                    await simulate_human_reading(client, entity)
-                    spontaneous_text = await generate_spontaneous_topic(character)
-                    if spontaneous_text:
-                        async with client.action(entity, 'typing'):
-                            await asyncio.sleep(2)
-                        await client.send_message(entity, spontaneous_text)
-                        add_message(character, "assistant", spontaneous_text)
-                        write_character(path, character)
-                        log.info(f"الحساب ({me.first_name}) انضم للجروب وبدأ بالسوالف فوراً!")
-            except Exception as e:
-                log.error(f"خطأ أثناء الانضمام الأولي للجروب {g_item}: {e}")
-
-    # تعريف مستقبل الرسائل للتفاعل المستمر
-    @client.on(events.NewMessage(incoming=True))
-    async def handler(event):
-        if not settings.get("running"):
-            return
-        if not event.is_group:
-            return
-
-        chat = await event.get_chat()
-        chat_id_str = str(chat.id)
-        registered_groups = settings.get("groups", [])
-
-        if registered_groups:
-            matched = False
-            for g in registered_groups:
-                if chat_id_str in g or str(event.chat_id) in g or g in str(chat.id):
-                    matched = True
-                    break
-            if not matched:
-                return
-
-        if event.sender_id == me.id:
-            return
-
-        await simulate_human_reading(client, chat)
-
-        char_name = me.first_name or "شخصية"
-        path, character = find_character(char_name)
-        if not path or not character:
-            path, character = create_character(char_name)
-
-        message_text = (event.raw_text or "").strip()
-        if not message_text:
-            return
-
-        sender = await event.get_sender()
-        sender_name = getattr(sender, "first_name", "صديق")
-
-        add_message(character, "user", f"{sender_name}: {message_text}")
-
+def handle_callback(update):
+    query = update.get("callback_query", {})
+    user_id = (query.get("from") or {}).get("id")
+    data = query.get("data", "")
+    if not is_admin(user_id):
+        tg("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "هذا التحكم للمدير فقط.", "show_alert": True})
+        return
+    if data == "on": STATE["enabled"] = True
+    elif data == "off": STATE["enabled"] = False
+    elif data == "status": pass
+    elif data == "help":
+        tg("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "اكتب /setgroup داخل المجموعة أولاً."})
+        return
+    tg("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "تم تحديث الحالة."})
+    msg = query.get("message", {})
+    chat_id = (msg.get("chat") or {}).get("id")
+    if chat_id:
         try:
-            async with client.action(chat, 'typing'):
-                await asyncio.sleep(2.5)
-                reply_text = await generate_human_chat(character, message_text, sender_name)
+            tg("editMessageText", {"chat_id": chat_id, "message_id": msg.get("message_id"), "text": status_text(), "reply_markup": keyboard()})
         except Exception:
-            log.exception("خطأ في توليد السالفة")
-            return
-
-        if reply_text:
-            add_message(character, "assistant", reply_text)
-            write_character(path, character)
-            await event.reply(reply_text)
-
-    return client
+            send(chat_id, status_text(), keyboard())
 
 
-# ==================================================
-# التشغيل الرئيسي
-# ==================================================
-
-async def main():
-    if not BOT_TOKEN or not API_ID or not API_HASH:
-        raise RuntimeError("تأكد من ضبط متغيرات البيئة (BOT_TOKEN, API_ID, API_HASH).")
-
-    save_settings()
-
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("menu", start))
-    bot_app.add_handler(CallbackQueryHandler(callback_handler))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_text_handler))
-
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=False)
-    log.info("بدأ تشغيل بوت الإدارة.")
-
-    # 1. انتظار جلسات تليغرام واتصالها أولاً
-    session_files = list(SESSIONS_DIR.glob("*.session"))
-    clients = []
-    
-    for sf in session_files:
-        c = await initialize_client_and_join(sf)
-        if c:
-            clients.append(c)
-
-    log.info("تم اتصال كافة الجلسات وانضمامها بنجاح.")
-
-    tasks = [c.run_until_disconnected() for c in clients]
-    if tasks:
-        await asyncio.gather(*tasks)
-    else:
-        while True:
-            await asyncio.sleep(3600)
-
+def main():
+    print("Bot started. Polling Telegram updates...")
+    # Clear any pending updates on initial launch to avoid replaying old messages.
+    try:
+        tg("deleteWebhook", {"drop_pending_updates": False})
+    except Exception as e:
+        print("Webhook note:", e)
+    while True:
+        try:
+            updates = tg("getUpdates", {"offset": STATE["offset"], "timeout": 30, "allowed_updates": ["message", "callback_query"]})
+            for update in updates:
+                STATE["offset"] = update["update_id"] + 1
+                try:
+                    if "callback_query" in update:
+                        handle_callback(update)
+                    elif "message" in update:
+                        handle_message(update["message"])
+                except Exception as e:
+                    print("Update error:", repr(e))
+        except KeyboardInterrupt:
+            print("Stopped.")
+            break
+        except Exception as e:
+            print("Polling error:", repr(e))
+            time.sleep(4)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
