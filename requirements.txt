@@ -1,3 +1,2 @@
-telethon
 google-genai
 python-telegram-bot
