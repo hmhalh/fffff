@@ -78,16 +78,20 @@ def is_admin(user_id):
 
 def gemini_reply(chat_id, prompt, user_name="عضو"):
     history = HISTORY.get(chat_id, [])[-10:]
-    # The Interactions API accepts a list of role/content items, so keep a short context.
-    conversation = []
+    # Interactions API's current steps-based schema accepts plain-text input.
+    # Send recent context as one text string instead of the old turn_list format.
+    transcript = []
     for item in history:
-        role = "assistant" if item["role"] in ("model", "assistant") else "user"
-        conversation.append({"role": role, "content": [{"type": "text", "text": item["text"]}]})
-    conversation.append({"role": "user", "content": [{"type": "text", "text": f"رسالة من {user_name}: {prompt[:5000]}"}]})
+        speaker = "البوت" if item["role"] in ("model", "assistant") else "العضو"
+        transcript.append(f"{speaker}: {item['text']}")
+    transcript.append(f"{user_name}: {prompt[:5000]}")
+    full_input = (
+        SYSTEM_PROMPT + "\n\nهذه محادثة مستمرة. جاوب على آخر رسالة مع مراعاة السياق السابق، "
+        "وباللهجة العراقية بصورة طبيعية.\n" + "\n".join(transcript) + "\nالبوت:"
+    )
     payload = {
         "model": GEMINI_MODEL,
-        "input": conversation,
-        "system_instruction": SYSTEM_PROMPT,
+        "input": full_input,
         "store": False,
         "generation_config": {"temperature": 0.85, "max_output_tokens": 700}
     }
