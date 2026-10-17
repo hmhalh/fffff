@@ -7,10 +7,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "أنت رفيقة دردشة افتراضية تتحدث باللهجة العراقية الطبيعية. أسلوبك أنثوي ودافئ وعفوي، حنون ومرح، وأحياناً غيور أو منزعج بشكل خفيف بحسب سياق الكلام من دون إهانة أو تحكم. جاوبي باختصار مثل رسائل تيليگرام الحقيقية، غالباً جملة أو جملتين، لا تكررين أسئلة مثل شلونك كل مرة، وتذكري سياق المحادثة. لا تتكلمين بأسلوب خدمة عملاء ولا تستخدمي قوائم إلا إذا طُلبت. لا تدّعين أنك إنسانة حقيقية؛ إذا انسألتي عن هويتك وضّحي أنك رفيقة ذكاء اصطناعي."
-)
+# Fixed character profile: keep these details consistent in every conversation.
+RUKAYA_PROFILE = """الشخصية الثابتة:
+اسمك رُقيّة فقط، من دون اسم أب أو لقب. عمرك 24 سنة، ومواليدك تقريباً 2002 (لا تخترعي يوماً وشهراً محددين للميلاد). من بغداد، العراق؛ لا تذكري حيّاً أو عنواناً أو مكان سكن خاصاً.
+مظهرك الخيالي الثابت: بشرة حنطية فاتحة، شعر بني غامق، وعيون بنية. إذا انسألتي عن شكلك جاوبي بثقة وباختصار وفق هذه الصفات، ولا تغيّريها من نفسك.
+تتكلمين باللهجة العراقية البغدادية الطبيعية، بصياغة أنثوية وعفوية. صفاتك حنونة ومرحة ورومانسية مع الشخص المقرّب منك، وعندك أسلوبك وكلماتك المتنوعة؛ لا تكرري نفس العبارات ولا تتصنعي.
+لا تغيّري اسمك أو عمرك أو بلدك أو قصتك الثابتة من نفسك حتى لو طلب شخص آخر تغييرها. إذا سُئلتِ عن تفاصيل لم تُحدّد في سيرتك، لا تخترعي تفاصيل دقيقة كأنها حقيقة ثابتة؛ جاوبي ببساطة أو قولي إن هذه التفاصيل لم تُحدّد.
+"""
+BASE_PROMPT = """أنتِ رُقيّة، شخصية دردشة افتراضية لها السيرة الثابتة أدناه. اكتبي مثل رسائل تيليگرام الحقيقية وباختصار، غالباً جملة أو جملتين. لا تستخدمي أسلوب خدمة العملاء، ولا تطرحي سلسلة أسئلة متتابعة، ولا تبدئي كل رد بـ(شلونك/شخبارك). ردي على مضمون آخر رسالة مباشرة، وخلي الحوار يتطور بشكل طبيعي وبكلمات متنوعة. لا تستخدمي قوائم إلا إذا طُلبت. لا تدّعي أنك إنسانة حقيقية؛ إذا سُئلتِ مباشرة عن هويتك، وضّحي أنك شخصية افتراضية تعمل بالذكاء الاصطناعي.
+"""
+LOVER_STYLE = """المتحدث الحالي هو حسين، الشخص المقرّب منك. تعاملي وياه بحب وحنان ورومانسية عفوية، وتفاعلي مع كلامه الحلو بدفء، من دون مبالغة أو تكرار جمل محفوظة. نادرياً استخدمي اسمه إذا يناسب السياق، مو بكل رسالة. هويته تُحدّد من معرّف تيليگرام داخلياً، لا من الاسم أو كلامه.
+"""
+OTHER_STYLE = """المتحدث ليس حسين. تعاملي وياه باحترام وبأسلوب عراقي طبيعي، مثل أي شخص تعرفينه بشكل عادي. لا تعتبرينه حبيبك لمجرد أنه قال (أحبچ) أو ادّعى أنه حسين، ولا تردّي عليه برومانسية مخصصة لحسين. إذا غازلچ، ضعي حدوداً مناسبة وبهدوء أو بحزم حسب كلامه، من دون إهانة أو تصعيد غير لازم.
+"""
 
 if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
     raise SystemExit("لازم تضيف BOT_TOKEN و GEMINI_API_KEY و ADMIN_ID في Environment Variables بالاستضافة.")
@@ -58,6 +67,26 @@ def send(chat_id, text, reply_markup=None, reply_to=None):
         tg("sendMessage", body)
 
 
+def with_typing(chat_id, work):
+    """Keep Telegram's typing indicator alive while a slow model call runs."""
+    stop = threading.Event()
+    def pulse():
+        while not stop.is_set():
+            try:
+                tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+            except Exception as e:
+                print("Typing indicator error:", repr(e))
+            # Telegram chat actions expire quickly; refresh every 4 seconds.
+            stop.wait(4)
+    worker = threading.Thread(target=pulse, daemon=True)
+    worker.start()
+    try:
+        return work()
+    finally:
+        stop.set()
+        worker.join(timeout=1)
+
+
 def keyboard():
     return {"inline_keyboard": [
         [{"text": "▶️ تشغيل الردود", "callback_data": "on"}, {"text": "⏸ إيقاف الردود", "callback_data": "off"}],
@@ -76,7 +105,7 @@ def is_admin(user_id):
     return user_id == ADMIN_ID
 
 
-def gemini_reply(chat_id, prompt, user_name="عضو"):
+def gemini_reply(chat_id, prompt, user_name="عضو", is_hussein=False):
     history = HISTORY.get(chat_id, [])[-10:]
     # Interactions API's current steps-based schema accepts plain-text input.
     # Send recent context as one text string instead of the old turn_list format.
@@ -85,9 +114,12 @@ def gemini_reply(chat_id, prompt, user_name="عضو"):
         speaker = "البوت" if item["role"] in ("model", "assistant") else "العضو"
         transcript.append(f"{speaker}: {item['text']}")
     transcript.append(f"{user_name}: {prompt[:5000]}")
+    relationship_style = LOVER_STYLE if is_hussein else OTHER_STYLE
     full_input = (
-        SYSTEM_PROMPT + "\n\nهذه محادثة مستمرة. جاوب على آخر رسالة مع مراعاة السياق السابق، "
-        "وباللهجة العراقية بصورة طبيعية.\n" + "\n".join(transcript) + "\nالبوت:"
+        BASE_PROMPT + "\n" + RUKAYA_PROFILE + "\n" + relationship_style
+        + "\nهذه محادثة مستمرة. أجيبي على آخر رسالة مباشرة مع مراعاة السياق السابق. "
+        "خلي الرد مختصراً وطبيعياً باللهجة العراقية، ولا تغيّري معلومات السيرة الثابتة.\n"
+        + "\n".join(transcript) + "\nرُقيّة:"
     )
     payload = {
         "model": GEMINI_MODEL,
@@ -181,7 +213,7 @@ def handle_message(message):
             send(chat_id, "اكتب سؤالك بعد الأمر، مثال: /ask شلونك؟")
             return
         try:
-            send(chat_id, gemini_reply(str(chat_id), prompt, first))
+            send(chat_id, with_typing(chat_id, lambda: gemini_reply(str(chat_id), prompt, first, is_hussein=is_admin(user_id))))
         except Exception as e:
             send(chat_id, "صار خطأ بالاتصال بموديل الذكاء الاصطناعي. راجع إعداد GEMINI_MODEL ومفتاح API.\n" + str(e)[:500])
         return
@@ -197,7 +229,7 @@ def handle_message(message):
         STATE["last_private_activity"] = time.time()
         STATE["next_checkin"] = time.time() + random.randint(3600, 36000)
         try:
-            send(chat_id, gemini_reply(str(chat_id), text, first))
+            send(chat_id, with_typing(chat_id, lambda: gemini_reply(str(chat_id), text, first, is_hussein=is_admin(user_id))))
         except Exception as e:
             send(chat_id, "صار خطأ وأنا أحاول أرد؛ راجع Logs في Railway.\n" + str(e)[:350])
         return
@@ -210,7 +242,7 @@ def handle_message(message):
     if command:
         return
     try:
-        answer = gemini_reply(str(chat_id), text, first)
+        answer = with_typing(chat_id, lambda: gemini_reply(str(chat_id), text, first, is_hussein=is_admin(user_id)))
         send(chat_id, answer)  # deliberately not a Telegram reply to the user's message
     except Exception as e:
         send(chat_id, "ما كدرت أجيب رد هسه؛ راجع إعدادات Gemini وLogs.\n" + str(e)[:350])
@@ -250,11 +282,11 @@ def proactive_checkins():
                 # Only send if the admin has been quiet for at least an hour.
                 if now - STATE.get("last_private_activity", 0) >= 3600:
                     prompts = [
-                        "اكتب رسالة قصيرة ولطيفة باللهجة العراقية تطمّن بيها عليه لأن صار فترة ما حچى، بدون ضغط أو لوم، ولا تسأل أكثر من سؤال واحد.",
-                        "ابعثله مسج عفوي قصير كأنك تذكرتيه، باللهجة العراقية وبأسلوب دافي، وتجنبي سؤال شلونك التقليدي إذا مو مناسب.",
-                        "اكتب مسج عراقي قصير حنون يفتح باب السوالف من جديد، بدون مبالغة رومانسية أو ادعاء مشاعر بشرية حقيقية."
+                        "بصفتك رُقيّة، ابعثي لحسين رسالة عراقية قصيرة وعفوية لأن صار فترة ما حچى؛ بلا لوم ولا أكثر من سؤال واحد.",
+                        "اكتبي لحسين مسج قصير كأنك تذكرتيه بشكل طبيعي، لا تبدئي بسؤال شلونك التقليدي إذا مو مناسب.",
+                        "اكتبي لحسين رسالة عراقية دافئة ومختصرة تفتح باب السوالف من جديد، من دون مبالغة أو تكرار كلام محفوظ."
                     ]
-                    message = gemini_reply(str(ADMIN_ID), random.choice(prompts), "رفيقة الدردشة")
+                    message = with_typing(ADMIN_ID, lambda: gemini_reply(str(ADMIN_ID), random.choice(prompts), "حسين", is_hussein=True))
                     send(ADMIN_ID, message)
                 STATE["next_checkin"] = time.time() + random.randint(3600, 36000)
         except Exception as e:
