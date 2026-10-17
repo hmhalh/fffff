@@ -15,7 +15,7 @@ import urllib.request
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
 
 if not BOT_TOKEN or not GEMINI_API_KEY or not OWNER_ID_RAW:
