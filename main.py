@@ -6,7 +6,7 @@ import os, json, time, urllib.request, urllib.parse, urllib.error, threading
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "أنت مساعد ذكاء اصطناعي ودود يتحدث باللهجة العراقية بشكل طبيعي ومحترم. أجب باختصار وبحسب سياق المحادثة. وضّح أنك مساعد ذكاء اصطناعي إذا سُئلت عن هويتك. لا تدّعِ أنك إنسان حقيقي."
@@ -20,8 +20,8 @@ except ValueError:
     raise SystemExit("ADMIN_ID لازم يكون رقم تيليجرام الرقمي مالك.")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(GEMINI_MODEL, safe='')}:generateContent"
-STATE = {"enabled": False, "group_id": None, "group_title": "غير محددة", "offset": 0}
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+STATE = {"enabled": True, "group_id": None, "group_title": "أي مجموعة مضاف إلها البوت", "offset": 0, "bot_id": None, "bot_username": ""}
 HISTORY = {}  # in-memory chat context; clears when the process restarts
 LOCK = threading.Lock()
 
@@ -69,7 +69,7 @@ def status_text():
     return (f"الحالة: {'🟢 شغّال' if STATE['enabled'] else '🔴 متوقف'}\n"
             f"المجموعة: {STATE['group_title']}\n"
             f"الموديل: {GEMINI_MODEL}\n\n"
-            "للرد بالمجموعة: منشن البوت أو ردّ على رسالة منه، أو استخدم /ask نص السؤال.")
+            "البوت يرد تلقائياً بأي مجموعة مضاف إلها إذا أحد منشنه أو ردّ على رسالته.")
 
 
 def is_admin(user_id):
@@ -77,28 +77,43 @@ def is_admin(user_id):
 
 
 def gemini_reply(chat_id, prompt, user_name="عضو"):
-    history = HISTORY.get(chat_id, [])[-12:]
-    contents = []
+    history = HISTORY.get(chat_id, [])[-10:]
+    # The Interactions API accepts a list of role/content items, so keep a short context.
+    conversation = []
     for item in history:
-        contents.append({"role": item["role"], "parts": [{"text": item["text"]}]})
-    contents.append({"role": "user", "parts": [{"text": f"رسالة من {user_name}: {prompt[:5000]}"}]})
+        role = "assistant" if item["role"] in ("model", "assistant") else "user"
+        conversation.append({"role": role, "content": [{"type": "text", "text": item["text"]}]})
+    conversation.append({"role": "user", "content": [{"type": "text", "text": f"رسالة من {user_name}: {prompt[:5000]}"}]})
     payload = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": contents,
-        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 700}
+        "model": GEMINI_MODEL,
+        "input": conversation,
+        "system_instruction": SYSTEM_PROMPT,
+        "store": False,
+        "generation_config": {"temperature": 0.85, "max_output_tokens": 700}
     }
     result = http_json(GEMINI_URL, payload, {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
     })
-    candidates = result.get("candidates", [])
-    if not candidates:
-        feedback = result.get("promptFeedback", {})
-        raise RuntimeError("Gemini لم يرجع إجابة. " + json.dumps(feedback, ensure_ascii=False)[:300])
-    parts = candidates[0].get("content", {}).get("parts", [])
-    answer = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+
+    # Response shape can contain output_text or text blocks inside output/steps.
+    answer = result.get("output_text", "") if isinstance(result, dict) else ""
+    if not answer and isinstance(result, dict):
+        pieces = []
+        def collect_text(obj):
+            if isinstance(obj, dict):
+                if obj.get("type") in ("text", "output_text") and isinstance(obj.get("text"), str):
+                    pieces.append(obj["text"])
+                for key, value in obj.items():
+                    if key not in ("text",) or obj.get("type") not in ("text", "output_text"):
+                        collect_text(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    collect_text(value)
+        collect_text(result.get("output", result.get("steps", [])))
+        answer = "\n".join(x for x in pieces if x.strip())
     if not answer.strip():
-        raise RuntimeError("الموديل رجّع إجابة فارغة.")
+        raise RuntimeError("Gemini ما رجّع نص. تحقق من اسم الموديل وصلاحية مفتاح API.")
     HISTORY[chat_id] = (history + [
         {"role": "user", "text": f"رسالة من {user_name}: {prompt[:5000]}"},
         {"role": "model", "text": answer[:6000]}
@@ -123,13 +138,13 @@ def handle_message(message):
         if not is_admin(user_id):
             send(chat_id, "هذا بوت خاص بمديره فقط.")
             return
-        send(chat_id, "أهلاً! هاي لوحة التحكم. أضف البوت للمجموعة، وخلي عنده صلاحية إرسال الرسائل وقراءة الرسائل المطلوبة، ثم اكتب /setgroup داخل المجموعة.", keyboard())
+        send(chat_id, "أهلاً! البوت يشتغل تلقائياً بأي مجموعة مضاف إلها. منشنه بـ @اسم_البوت أو ردّ على رسالته حتى يسولف وياك. هاي لوحة التحكم اختيارية.", keyboard())
         return
     if command in ("/help", "/start"):
         if chat_type == "private" and not is_admin(user_id):
             send(chat_id, "هذا بوت خاص بمديره فقط.")
             return
-        send(chat_id, "الأوامر:\n/setgroup — تعيين المجموعة (داخل المجموعة)\n/ask نص — سؤال مباشر\n/status — الحالة\n/on — تشغيل الردود\n/off — إيقاف الردود\n\nيرد البوت بالمجموعة عند منشنه أو الرد على رسالته أو استخدام /ask.", keyboard() if chat_type == "private" else None)
+        send(chat_id, "الأوامر:\n/ask نص — سؤال مباشر (اختياري)\n/status — الحالة\n/on — تشغيل الردود\n/off — إيقاف الردود\n\nما تحتاج /start أو /setgroup حتى يرد بالمجموعة؛ فقط منشن البوت أو ردّ على رسالته.", keyboard() if chat_type == "private" else None)
         return
     if command == "/setgroup":
         if not is_admin(user_id):
@@ -140,7 +155,7 @@ def handle_message(message):
             return
         STATE["group_id"] = chat_id
         STATE["group_title"] = chat.get("title", str(chat_id))
-        send(chat_id, "✅ تم تعيين هذه المجموعة. ارجع للخاص واضغط تشغيل الردود.")
+        send(chat_id, "✅ تم تسجيل المجموعة. البوت يرد تلقائياً عند منشنه أو الرد على رسالته.")
         return
     if command in ("/on", "/off", "/status"):
         if not is_admin(user_id):
@@ -158,29 +173,30 @@ def handle_message(message):
         if not prompt:
             send(chat_id, "اكتب سؤالك بعد الأمر، مثال: /ask شلونك؟")
             return
-        if chat_type != "private" and STATE["group_id"] != chat_id:
-            send(chat_id, "هذه المجموعة مو محددة للمساعد. المدير يكتب /setgroup هنا أولاً.")
-            return
         try:
             send(chat_id, gemini_reply(str(chat_id), prompt, first), reply_to=message.get("message_id"))
         except Exception as e:
             send(chat_id, "صار خطأ بالاتصال بموديل الذكاء الاصطناعي. راجع إعداد GEMINI_MODEL ومفتاح API.\n" + str(e)[:500])
         return
 
-    # Respond only in the explicitly selected group and only when addressed.
-    if chat_type not in ("group", "supergroup") or chat_id != STATE["group_id"] or not STATE["enabled"]:
+    # Start automatically: in any group, answer only when this bot is mentioned or replied to.
+    if chat_type not in ("group", "supergroup") or not STATE["enabled"]:
         return
-    bot_username = os.getenv("BOT_USERNAME", "").strip().lstrip("@").lower()
-    entities = message.get("entities", [])
-    mentioned = bool(bot_username and f"@{bot_username}" in lower)
+    bot_username = STATE.get("bot_username", "").lower()
+    mentioned = False
+    for entity in message.get("entities", []):
+        if entity.get("type") == "mention":
+            offset, length = entity.get("offset", 0), entity.get("length", 0)
+            if text[offset:offset + length].lstrip("@").lower() == bot_username and bot_username:
+                mentioned = True
+                break
+    if not mentioned and bot_username:
+        mentioned = f"@{bot_username}" in lower
     replied_to_bot = False
     reply = message.get("reply_to_message") or {}
-    if reply.get("from", {}).get("is_bot"):
-        # Best effort: reply must point to this bot, not any other bot.
-        me = os.getenv("BOT_ID", "").strip()
-        replied_to_bot = bool(me and str(reply.get("from", {}).get("id")) == me)
-        if not me:
-            replied_to_bot = bool(bot_username and reply.get("from", {}).get("username", "").lower() == bot_username)
+    reply_from = reply.get("from", {})
+    if reply_from.get("is_bot") and STATE.get("bot_id") is not None:
+        replied_to_bot = reply_from.get("id") == STATE["bot_id"]
     if not (mentioned or replied_to_bot):
         return
     prompt = text
@@ -219,7 +235,10 @@ def handle_callback(update):
 
 
 def main():
-    print("Bot started. Polling Telegram updates...")
+    me = tg("getMe")
+    STATE["bot_id"] = me.get("id")
+    STATE["bot_username"] = (me.get("username") or os.getenv("BOT_USERNAME", "").lstrip("@")).lower()
+    print(f"Bot started as @{STATE['bot_username']}. Automatic group replies enabled.")
     # Clear any pending updates on initial launch to avoid replaying old messages.
     try:
         tg("deleteWebhook", {"drop_pending_updates": False})
