@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Single-file Telegram + Gemini group assistant. Python 3.10+, no pip packages required."""
-import os, json, time, urllib.request, urllib.parse, urllib.error, threading
+import os, json, time, random, urllib.request, urllib.parse, urllib.error, threading
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -9,7 +9,7 @@ ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "أنت مساعد ذكاء اصطناعي ودود يتحدث باللهجة العراقية بشكل طبيعي ومحترم. أجب باختصار وبحسب سياق المحادثة. وضّح أنك مساعد ذكاء اصطناعي إذا سُئلت عن هويتك. لا تدّعِ أنك إنسان حقيقي."
+    "أنت رفيقة دردشة افتراضية تتحدث باللهجة العراقية الطبيعية. أسلوبك أنثوي ودافئ وعفوي، حنون ومرح، وأحياناً غيور أو منزعج بشكل خفيف بحسب سياق الكلام من دون إهانة أو تحكم. جاوبي باختصار مثل رسائل تيليگرام الحقيقية، غالباً جملة أو جملتين، لا تكررين أسئلة مثل شلونك كل مرة، وتذكري سياق المحادثة. لا تتكلمين بأسلوب خدمة عملاء ولا تستخدمي قوائم إلا إذا طُلبت. لا تدّعين أنك إنسانة حقيقية؛ إذا انسألتي عن هويتك وضّحي أنك رفيقة ذكاء اصطناعي."
 )
 
 if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
@@ -21,7 +21,7 @@ except ValueError:
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
-STATE = {"enabled": True, "group_id": None, "group_title": "أي مجموعة مضاف إلها البوت", "offset": 0, "bot_id": None, "bot_username": ""}
+STATE = {"enabled": True, "group_id": None, "group_title": "ما محددة بعد — اكتب /setgroup داخل مجموعتك", "offset": 0, "bot_id": None, "bot_username": "", "private_started": False, "next_checkin": 0, "last_private_activity": 0}
 HISTORY = {}  # in-memory chat context; clears when the process restarts
 LOCK = threading.Lock()
 
@@ -69,7 +69,7 @@ def status_text():
     return (f"الحالة: {'🟢 شغّال' if STATE['enabled'] else '🔴 متوقف'}\n"
             f"المجموعة: {STATE['group_title']}\n"
             f"الموديل: {GEMINI_MODEL}\n\n"
-            "البوت يرد تلقائياً بأي مجموعة مضاف إلها إذا أحد منشنه أو ردّ على رسالته.")
+            "الدردشة الخاصة: رد تلقائي على كل رسالة. المجموعة المحددة: رد مستقل على رسائل الأعضاء بدون الحاجة لمنشن أو رد. الرسائل الاستباقية الخاصة مفعّلة بعد بدء المحادثة.")
 
 
 def is_admin(user_id):
@@ -142,13 +142,16 @@ def handle_message(message):
         if not is_admin(user_id):
             send(chat_id, "هذا بوت خاص بمديره فقط.")
             return
-        send(chat_id, "أهلاً! البوت يشتغل تلقائياً بأي مجموعة مضاف إلها. منشنه بـ @اسم_البوت أو ردّ على رسالته حتى يسولف وياك. هاي لوحة التحكم اختيارية.", keyboard())
+        STATE["private_started"] = True
+        STATE["last_private_activity"] = time.time()
+        STATE["next_checkin"] = time.time() + random.randint(3600, 36000)
+        send(chat_id, "هلا بيك 🌷 آني موجودة هنا، اكتبلي بشكل طبيعي ونسولف، ما تحتاج أوامر. ومن وقت للثاني ممكن أطمّن عليك برسالة خفيفة.", keyboard())
         return
     if command in ("/help", "/start"):
         if chat_type == "private" and not is_admin(user_id):
             send(chat_id, "هذا بوت خاص بمديره فقط.")
             return
-        send(chat_id, "الأوامر:\n/ask نص — سؤال مباشر (اختياري)\n/status — الحالة\n/on — تشغيل الردود\n/off — إيقاف الردود\n\nما تحتاج /start أو /setgroup حتى يرد بالمجموعة؛ فقط منشن البوت أو ردّ على رسالته.", keyboard() if chat_type == "private" else None)
+        send(chat_id, "الأوامر:\n/setgroup — اربط المجموعة (اكتبها داخل المجموعة)\n/status — الحالة\n/on — تشغيل\n/off — إيقاف\n\nبالخاص اكتبلي مباشرة بدون /ask. وبالمجموعة المحددة أرد برسالة مستقلة على الكلام بدون منشن أو رد.", keyboard() if chat_type == "private" else None)
         return
     if command == "/setgroup":
         if not is_admin(user_id):
@@ -159,7 +162,7 @@ def handle_message(message):
             return
         STATE["group_id"] = chat_id
         STATE["group_title"] = chat.get("title", str(chat_id))
-        send(chat_id, "✅ تم تسجيل المجموعة. البوت يرد تلقائياً عند منشنه أو الرد على رسالته.")
+        send(chat_id, "✅ تم ربط هاي المجموعة. من هسه أرد على الرسائل النصية برسالة مستقلة بدون ما تحتاج تسوي رد أو منشن. تأكد خصوصية المجموعة من BotFather مطفّية حتى أستلم كل الرسائل.")
         return
     if command in ("/on", "/off", "/status"):
         if not is_admin(user_id):
@@ -178,41 +181,39 @@ def handle_message(message):
             send(chat_id, "اكتب سؤالك بعد الأمر، مثال: /ask شلونك؟")
             return
         try:
-            send(chat_id, gemini_reply(str(chat_id), prompt, first), reply_to=message.get("message_id"))
+            send(chat_id, gemini_reply(str(chat_id), prompt, first))
         except Exception as e:
             send(chat_id, "صار خطأ بالاتصال بموديل الذكاء الاصطناعي. راجع إعداد GEMINI_MODEL ومفتاح API.\n" + str(e)[:500])
         return
 
-    # Start automatically: in any group, answer only when this bot is mentioned or replied to.
+    # Private chat: natural conversation without /ask. The admin starts the bot once.
+    if chat_type == "private":
+        if not is_admin(user_id):
+            send(chat_id, "هذا البوت خاص بمديره حالياً.")
+            return
+        if not STATE["enabled"]:
+            return
+        STATE["private_started"] = True
+        STATE["last_private_activity"] = time.time()
+        STATE["next_checkin"] = time.time() + random.randint(3600, 36000)
+        try:
+            send(chat_id, gemini_reply(str(chat_id), text, first))
+        except Exception as e:
+            send(chat_id, "صار خطأ وأنا أحاول أرد؛ راجع Logs في Railway.\n" + str(e)[:350])
+        return
+
+    # In the configured group, respond to each human text message as a standalone message.
     if chat_type not in ("group", "supergroup") or not STATE["enabled"]:
         return
-    bot_username = STATE.get("bot_username", "").lower()
-    mentioned = False
-    for entity in message.get("entities", []):
-        if entity.get("type") == "mention":
-            offset, length = entity.get("offset", 0), entity.get("length", 0)
-            if text[offset:offset + length].lstrip("@").lower() == bot_username and bot_username:
-                mentioned = True
-                break
-    if not mentioned and bot_username:
-        mentioned = f"@{bot_username}" in lower
-    replied_to_bot = False
-    reply = message.get("reply_to_message") or {}
-    reply_from = reply.get("from", {})
-    if reply_from.get("is_bot") and STATE.get("bot_id") is not None:
-        replied_to_bot = reply_from.get("id") == STATE["bot_id"]
-    if not (mentioned or replied_to_bot):
+    if STATE.get("group_id") is None or chat_id != STATE.get("group_id"):
         return
-    prompt = text
-    if bot_username:
-        prompt = prompt.replace("@" + bot_username, "").strip()
-    if not prompt:
-        prompt = "رد على رسالتي بشكل طبيعي باللهجة العراقية."
+    if command:
+        return
     try:
-        answer = gemini_reply(str(chat_id), prompt, first)
-        send(chat_id, answer, reply_to=message.get("message_id"))
+        answer = gemini_reply(str(chat_id), text, first)
+        send(chat_id, answer)  # deliberately not a Telegram reply to the user's message
     except Exception as e:
-        send(chat_id, "ما كدرت أجيب رد هسه؛ تأكد من مفتاح Gemini واسم الموديل.\n" + str(e)[:350], reply_to=message.get("message_id"))
+        send(chat_id, "ما كدرت أجيب رد هسه؛ راجع إعدادات Gemini وLogs.\n" + str(e)[:350])
 
 
 def handle_callback(update):
@@ -238,11 +239,36 @@ def handle_callback(update):
             send(chat_id, status_text(), keyboard())
 
 
+
+def proactive_checkins():
+    """Send an occasional opt-in check-in only in the admin's already-started private chat."""
+    while True:
+        try:
+            now = time.time()
+            if (STATE.get("enabled") and STATE.get("private_started")
+                    and STATE.get("next_checkin", 0) and now >= STATE["next_checkin"]):
+                # Only send if the admin has been quiet for at least an hour.
+                if now - STATE.get("last_private_activity", 0) >= 3600:
+                    prompts = [
+                        "اكتب رسالة قصيرة ولطيفة باللهجة العراقية تطمّن بيها عليه لأن صار فترة ما حچى، بدون ضغط أو لوم، ولا تسأل أكثر من سؤال واحد.",
+                        "ابعثله مسج عفوي قصير كأنك تذكرتيه، باللهجة العراقية وبأسلوب دافي، وتجنبي سؤال شلونك التقليدي إذا مو مناسب.",
+                        "اكتب مسج عراقي قصير حنون يفتح باب السوالف من جديد، بدون مبالغة رومانسية أو ادعاء مشاعر بشرية حقيقية."
+                    ]
+                    message = gemini_reply(str(ADMIN_ID), random.choice(prompts), "رفيقة الدردشة")
+                    send(ADMIN_ID, message)
+                STATE["next_checkin"] = time.time() + random.randint(3600, 36000)
+        except Exception as e:
+            print("Check-in error:", repr(e))
+            STATE["next_checkin"] = time.time() + random.randint(3600, 36000)
+        time.sleep(30)
+
+
 def main():
     me = tg("getMe")
     STATE["bot_id"] = me.get("id")
     STATE["bot_username"] = (me.get("username") or os.getenv("BOT_USERNAME", "").lstrip("@")).lower()
-    print(f"Bot started as @{STATE['bot_username']}. Automatic group replies enabled.")
+    print(f"Bot started as @{STATE['bot_username']}. Private chat and configured-group auto replies enabled.")
+    threading.Thread(target=proactive_checkins, daemon=True).start()
     # Clear any pending updates on initial launch to avoid replaying old messages.
     try:
         tg("deleteWebhook", {"drop_pending_updates": False})
