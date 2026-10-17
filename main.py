@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -403,7 +402,19 @@ def main():
     )
 
     logger.info("Ruqaya bot is starting")
-    app.run_polling(drop_pending_updates=False)
+
+    async def run():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=False)
+
+        stop_signal = asyncio.Event()
+        await stop_signal.wait()
+
+    try:
+        asyncio.run(run())
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 
 if __name__ == "__main__":
