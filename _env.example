@@ -1,0 +1,6 @@
+# انسخ هذا الملف باسم .env وعبّي القيم
+BOT_TOKEN=ضع_توكن_البوت_من_BotFather
+GEMINI_API_KEY=ضع_مفتاح_Gemini_من_aistudio.google.com
+ADMIN_ID=7199778669
+GEMINI_MODEL=gemini-2.5-flash
+TZ_NAME=Asia/Baghdad
