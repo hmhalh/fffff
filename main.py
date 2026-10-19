@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -267,7 +268,46 @@ FALLBACK_PING = {
 # ───────────────────────── Gemini ─────────────────────────
 
 
+GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_model = {"name": None}   # الموديل اللي انكتشف تلقائياً
+
+
+async def pick_model():
+    """يسأل Gemini عن الموديلات المتاحة لمفتاحك ويختار أحدث موديل flash مستقر."""
+    r = await http.get(f"{GEM_BASE}/models?pageSize=200", headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
+    r.raise_for_status()
+    bad = ("lite", "image", "tts", "live", "audio", "embed", "robotics", "computer", "learn", "vision", "aqa")
+    best, best_key = None, None
+    for m in r.json().get("models", []):
+        name = m.get("name", "").split("/")[-1]
+        low = name.lower()
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        if not low.startswith("gemini") or "flash" not in low or any(b in low for b in bad):
+            continue
+        v = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
+        key = (float(v.group(1)) if v else 0.0, not ("preview" in low or "exp" in low), "latest" not in low)
+        if best_key is None or key > best_key:
+            best, best_key = name, key
+    return best
+
+
 async def gemini(system, history, user_text):
+    model = _model["name"] or GEMINI_MODEL
+    try:
+        return await _gemini_call(model, system, history, user_text)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+        new = await pick_model()
+        if not new or new == model:
+            raise
+        log.info("Model %s not found, switching to %s", model, new)
+        _model["name"] = new
+        return await _gemini_call(new, system, history, user_text)
+
+
+async def _gemini_call(model, system, history, user_text):
     hist = list(history)
     while hist and hist[0][0] != "user":   # Gemini يتطلب أن تبدأ المحادثة بدور المستخدم
         hist.pop(0)
@@ -278,8 +318,10 @@ async def gemini(system, history, user_text):
         "contents": contents,
         "generationConfig": {"temperature": 1.0, "maxOutputTokens": 1024},
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    url = f"{GEM_BASE}/models/{model}:generateContent"
     r = await http.post(url, headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=45)
+    if r.status_code >= 400:
+        log.warning("Gemini %s: %s", r.status_code, r.text[:300])
     r.raise_for_status()
     data = r.json()
     parts = data["candidates"][0]["content"]["parts"]
