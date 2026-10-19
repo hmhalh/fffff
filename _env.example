@@ -1,6 +1,0 @@
-# انسخ هذا الملف باسم .env وعبّي القيم
-BOT_TOKEN=7838301513:AAFy_8aO61prq1S4-dgcfjwpIZuFd7mAfyE
-GEMINI_API_KEY=AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg
-ADMIN_ID=7199778669
-GEMINI_MODEL=gemini-2.5-flash
-TZ_NAME=Asia/Baghdad
