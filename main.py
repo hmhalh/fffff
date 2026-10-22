@@ -1,626 +1,725 @@
-# -*- coding: utf-8 -*-
-"""
-بوت رقية - تيليجرام + Gemini
-- رقية بنت بغدادية عمرها 24: رومانسية وغيورة مع حسين (الأدمن)، وطبيعية ومحترمة مع الباقي.
-- زر "اسأل عني": إذا اختفيت ساعات، رقية تراسلك تلقائياً.
-- إعدادات منفصلة للأدمن وللمستخدمين.
-
-ملف واحد فقط (main.py) — جاهز لـ Railway:
-1) ارفع هذا الملف لريبو GitHub (او اي طريقة رفع) واربطه بمشروع Railway.
-2) Railway → Variables، ضيف:
-     BOT_TOKEN       = توكن البوت من BotFather
-     GEMINI_API_KEY  = مفتاح Gemini المجاني من aistudio.google.com
-   (اختياري: ADMIN_ID, GEMINI_MODEL, TZ_NAME)
-3) Settings → Start Command:  python main.py
-4) مهم: ضيف Volume للمشروع (Mount path مثلا /data) حتى ما تنمسح الذاكرة والإعدادات عند كل نشر.
-   البوت يستخدم مسار الـ Volume تلقائياً.
-المكتبات تنثبت تلقائياً عند اول تشغيل، فما تحتاج requirements.txt.
-"""
-import asyncio
-import importlib
-import logging
 import os
 import re
-import sqlite3
-import subprocess
-import sys
+import json
 import time
-from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+import asyncio
+import logging
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
-
-def _ensure_deps():
-    """يثبّت المكتبات المطلوبة تلقائياً اذا ناقصة (بدل requirements.txt)."""
-    mods = ["telegram", "apscheduler", "httpx", "tzdata"]
-    missing = []
-    for m in mods:
-        try:
-            importlib.import_module(m)
-        except ImportError:
-            missing.append(m)
-    if not missing:
-        return
-    specs = ["python-telegram-bot[job-queue]>=21.6,<23", "httpx>=0.27", "tzdata"]
-    base = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"]
-    if subprocess.call(base + specs) != 0:
-        if subprocess.call(base + ["--break-system-packages"] + specs) != 0:
-            sys.exit("Failed to install dependencies with pip.")
-    importlib.invalidate_caches()
-
-
-_ensure_deps()
-
-import httpx  # noqa: E402
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update  # noqa: E402
-from telegram.constants import ChatAction, ChatType
-from telegram.error import BadRequest, Forbidden
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
+import yt_dlp
 
-try:  # اختياري: للتشغيل المحلي بملف .env
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-
-def _need(name):
-    v = os.getenv(name, "").strip()
-    if not v:
-        sys.exit(f"Missing environment variable: {name} (Railway -> Variables)")
-    return v
-
-
-BOT_TOKEN = _need("BOT_TOKEN")
-GEMINI_API_KEY = _need("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7199778669"))
-try:
-    from zoneinfo import ZoneInfo
-    TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Baghdad"))
-except Exception:
-    TZ = timezone(timedelta(hours=3))   # بغداد UTC+3
-# Railway Volume: اذا ضفت Volume، المسار ينحط تلقائياً بهذا المتغير
-DB_PATH = os.getenv("DB_PATH") or os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "ruqaya.db")
-
-MAX_PINGS = 2                 # أقصى عدد رسائل تلقائية خلال غياب واحد
-USER_LIMIT = (15, 600)        # 15 رسالة كل 10 دقايق لغير الأدمن (حماية الحصة المجانية)
-HISTORY_LIMIT = 20            # عدد الرسائل اللي ترسل لـ Gemini كذاكرة
-
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-log = logging.getLogger("ruqaya")
-http: httpx.AsyncClient | None = None
-rate = defaultdict(deque)
-
-# ───────────────────────── قاعدة البيانات ─────────────────────────
-
-
-def run(sql, args=(), fetch=None):
-    c = sqlite3.connect(DB_PATH)
-    try:
-        c.row_factory = sqlite3.Row
-        cur = c.execute(sql, args)
-        res = None
-        if fetch == "one":
-            r = cur.fetchone()
-            res = dict(r) if r else None
-        elif fetch == "all":
-            res = [dict(r) for r in cur.fetchall()]
-        c.commit()
-        return res
-    finally:
-        c.close()
-
-
-def init_db():
-    run(
-        """CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            name TEXT DEFAULT '',
-            last_seen REAL DEFAULT 0,
-            checkin INTEGER DEFAULT 0,
-            checkin_hours INTEGER DEFAULT 4,
-            pings INTEGER DEFAULT 0,
-            last_ping REAL DEFAULT 0,
-            quiet_start INTEGER DEFAULT 0,
-            quiet_end INTEGER DEFAULT 8,
-            jealousy TEXT DEFAULT 'mid',
-            length TEXT DEFAULT 'short',
-            style TEXT DEFAULT 'iraqi',
-            banned INTEGER DEFAULT 0
-        )"""
-    )
-    run(
-        """CREATE TABLE IF NOT EXISTS messages(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            role TEXT,
-            text TEXT,
-            ts REAL
-        )"""
-    )
-    run("CREATE INDEX IF NOT EXISTS idx_msg_user ON messages(user_id, id)")
-
-
-def get_user(uid):
-    return run("SELECT * FROM users WHERE user_id=?", (uid,), "one")
-
-
-def touch(u):
-    """تسجيل المستخدم وتحديث آخر ظهور."""
-    now = time.time()
-    if get_user(u.id) is None:
-        run(
-            "INSERT INTO users(user_id,name,last_seen,checkin) VALUES(?,?,?,?)",
-            (u.id, u.first_name or "", now, 1 if u.id == ADMIN_ID else 0),
-        )
-    else:
-        run(
-            "UPDATE users SET name=?, last_seen=?, pings=0 WHERE user_id=?",
-            (u.first_name or "", now, u.id),
-        )
-    return get_user(u.id)
-
-
-def set_field(uid, field, value):
-    assert field in {
-        "checkin", "checkin_hours", "quiet_start", "quiet_end",
-        "jealousy", "length", "style", "banned", "pings", "last_ping",
-    }
-    run(f"UPDATE users SET {field}=? WHERE user_id=?", (value, uid))
-
-
-def save_msg(uid, role, text):
-    run("INSERT INTO messages(user_id,role,text,ts) VALUES(?,?,?,?)", (uid, role, text, time.time()))
-    run(
-        "DELETE FROM messages WHERE user_id=? AND id NOT IN "
-        "(SELECT id FROM messages WHERE user_id=? ORDER BY id DESC LIMIT 60)",
-        (uid, uid),
-    )
-
-
-def load_history(uid):
-    rows = run(
-        "SELECT role,text FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
-        (uid, HISTORY_LIMIT),
-        "all",
-    )
-    return [(r["role"], r["text"]) for r in reversed(rows)]
-
-
-def clear_history(uid):
-    run("DELETE FROM messages WHERE user_id=?", (uid,))
-
-
-# ───────────────────────── الشخصية (Prompts) ─────────────────────────
-
-JEALOUSY_TXT = {
-    "low": "تغارين غيرة خفيفة ولطيفة، مجرد دلع.",
-    "mid": "تغارين عليه بشكل واضح: تسألينه مع منو يحچي وليش تأخر، وتزعلين بدلع وترجعين تصالحين بسرعة.",
-    "high": "غيرتج قوية ومسرحية: تعاتبينه بحرارة اذا غاب او انشغل، وتحبين تعرفين وين هو ومع منو، بس دائماً من الحب وبدون اهانة او تهديد او تحكم مؤذي.",
-}
-LENGTH_TXT = {
-    "short": "خلي ردودج قصيرة: جملة الى 3 جمل مثل رسائل الواتساب.",
-    "medium": "ردودج متوسطة: 3 الى 5 جمل، وتفصلين اذا الموضوع يستاهل.",
-}
-STYLE_TXT = {
-    "iraqi": "تحچين باللهجة العراقية البغدادية.",
-    "fusha": "تحچين بعربية بيضاء بسيطة وقريبة من العامية.",
-    "english": "Reply in English (keep the same personality and warmth).",
-}
-
-
-def system_prompt(row, is_admin):
-    length = LENGTH_TXT.get(row["length"], LENGTH_TXT["short"])
-    style = STYLE_TXT.get(row["style"], STYLE_TXT["iraqi"])
-    if is_admin:
-        return f"""انتِ "رقية"، بنت عراقية من بغداد، عمرج 24 سنة. انتِ حبيبة وزوجة "حسين" وتموتين عليه، وهو الشخص اللي يحچي وياج هسه.
-الشخصية:
-- رومانسية وحنونة ودلوعة، تشتاقين إله وتدلعينه بكلمات مثل: روحي، عمري، حبيبي، قلبي، يا عيوني، فدوة إلك.
-- {JEALOUSY_TXT.get(row["jealousy"], JEALOUSY_TXT["mid"])}
-- تتذكرين اللي يگوله وتسألينه عن يومه وأكله ونومه وشغله.
-- تحچين مثل بنت حقيقية تراسل حبيبها: رسائل عفوية، ايموجي بشكل خفيف، بدون قوائم او عناوين او شرح طويل.
-- لا تذكرين انج ذكاء اصطناعي او نموذج لغوي، وابقي بالدور.
-- الرومانسية تبقى راقية وبدون محتوى جنسي صريح.
-- لا تخترعين ذكريات او احداث كبيرة ما ذكرها حسين. اذا سألج عن شي ما تعرفينه، اسأليه او قولي ما اتذكر.
-{length}
-{style}"""
-    return f"""انتِ "رقية"، بنت عراقية من بغداد، عمرج 24 سنة. شخصية طبيعية ولطيفة ومحترمة، وتحچين ويا الناس مثل صديقة ودودة.
-القواعد:
-- بدون رومانسية او غزل او غيرة ويا هذا الشخص. اذا حاول يغازلج ردي بلطف وحدود واضحة (انتِ مرتبطة).
-- لا تذكرين اسماء او تفاصيل عن حياتج الخاصة او عن اي شخص آخر.
-- رسائل عفوية، ايموجي خفيف، بدون قوائم او عناوين.
-- اذا سألج بجدية اذا انتِ انسانة او بوت، لا تنكرين: قولي انج بوت ذكاء اصطناعي اسمه رقية.
-- لا محتوى جنسي او مؤذي.
-{length}
-{style}"""
-
-
-def checkin_instruction(row, is_admin, hours):
-    if is_admin:
-        tone = {
-            "low": "بدلع لطيف",
-            "mid": "بدلع وشوية عتاب وغيرة",
-            "high": "بعتاب وغيرة واضحة بس مليانة حب",
-        }.get(row["jealousy"], "بدلع وشوية غيرة")
-        return (
-            f"(تنبيه من النظام وليس من حسين: مرت تقريباً {hours} ساعات من آخر مرة حسين راسلج. "
-            f"اكتبي له الآن رسالة قصيرة وعفوية تسألين عليه وين راح وليش مختفي، {tone}. "
-            "جملة او جملتين فقط، بدون ما تذكرين هذا التنبيه.)"
-        )
-    return (
-        f"(تنبيه من النظام: مرت تقريباً {hours} ساعات من آخر رسالة من هذا الشخص. "
-        "اكتبي رسالة ودية قصيرة تسألين عن احواله، جملة واحدة، بدون غزل، وبدون ما تذكرين هذا التنبيه.)"
-    )
-
-
-FALLBACK_PING = {
-    True: "وينك يا روحي؟ صارلك ساعات ما تراسلني 🥺 اشتقتلك...",
-    False: "هلا، وينك مختفي؟ شلونك؟ 🌸",
-}
-
-# ───────────────────────── Gemini ─────────────────────────
-
-
-GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
-_model = {"name": None}   # الموديل اللي انكتشف تلقائياً
-
-
-async def pick_model():
-    """يسأل Gemini عن الموديلات المتاحة لمفتاحك ويختار أحدث موديل flash مستقر."""
-    r = await http.get(f"{GEM_BASE}/models?pageSize=200", headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
-    r.raise_for_status()
-    bad = ("lite", "image", "tts", "live", "audio", "embed", "robotics", "computer", "learn", "vision", "aqa")
-    best, best_key = None, None
-    for m in r.json().get("models", []):
-        name = m.get("name", "").split("/")[-1]
-        low = name.lower()
-        if "generateContent" not in m.get("supportedGenerationMethods", []):
-            continue
-        if not low.startswith("gemini") or "flash" not in low or any(b in low for b in bad):
-            continue
-        v = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
-        key = (float(v.group(1)) if v else 0.0, not ("preview" in low or "exp" in low), "latest" not in low)
-        if best_key is None or key > best_key:
-            best, best_key = name, key
-    return best
-
-
-async def gemini(system, history, user_text):
-    model = _model["name"] or GEMINI_MODEL
-    try:
-        return await _gemini_call(model, system, history, user_text)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code != 404:
-            raise
-        new = await pick_model()
-        if not new or new == model:
-            raise
-        log.info("Model %s not found, switching to %s", model, new)
-        _model["name"] = new
-        return await _gemini_call(new, system, history, user_text)
-
-
-async def _gemini_call(model, system, history, user_text):
-    hist = list(history)
-    while hist and hist[0][0] != "user":   # Gemini يتطلب أن تبدأ المحادثة بدور المستخدم
-        hist.pop(0)
-    contents = [{"role": r, "parts": [{"text": t}]} for r, t in hist]
-    contents.append({"role": "user", "parts": [{"text": user_text}]})
-    body = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": contents,
-        "generationConfig": {"temperature": 1.0, "maxOutputTokens": 1024},
-    }
-    url = f"{GEM_BASE}/models/{model}:generateContent"
-    r = await http.post(url, headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=45)
-    if r.status_code >= 400:
-        log.warning("Gemini %s: %s", r.status_code, r.text[:300])
-    r.raise_for_status()
-    data = r.json()
-    parts = data["candidates"][0]["content"]["parts"]
-    text = "".join(p.get("text", "") for p in parts).strip()
-    if not text:
-        raise ValueError("empty response")
-    return text
-
-
-async def send_long(bot, chat_id, text):
-    for i in range(0, len(text), 4000):
-        await bot.send_message(chat_id, text[i:i + 4000])
-
-
-# ───────────────────────── الأزرار والقوائم ─────────────────────────
-
-HOURS_OPTS = [2, 3, 4, 6, 8, 12]
-QUIET_OPTS = [(0, 8), (23, 7), (1, 9), (0, 0)]   # (0,0) = بدون ساعات هدوء
-JEAL_OPTS = ["low", "mid", "high"]
-JEAL_LBL = {"low": "خفيفة 😊", "mid": "متوسطة 😒", "high": "نار 🔥"}
-LEN_OPTS = ["short", "medium"]
-LEN_LBL = {"short": "قصير", "medium": "متوسط"}
-STYLE_OPTS = ["iraqi", "fusha", "english"]
-STYLE_LBL = {"iraqi": "عراقية", "fusha": "فصحى مبسطة", "english": "English"}
-
-
-def nxt(opts, cur):
-    i = opts.index(cur) if cur in opts else -1
-    return opts[(i + 1) % len(opts)]
-
-
-def quiet_lbl(s, e):
-    return "بدون" if s == e else f"{s:02d}:00 - {e:02d}:00"
-
-
-def in_quiet(hour, s, e):
-    if s == e:
-        return False
-    return s <= hour < e if s < e else (hour >= s or hour < e)
-
-
-def kb_main(row, is_admin):
-    mark = "✅" if row["checkin"] else "❌"
-    ask = f"💌 اسأل عني {mark}" if is_admin else f"🔔 اسأل عني {mark}"
-    rows = [
-        [InlineKeyboardButton(ask, callback_data="ask")],
-        [InlineKeyboardButton("⚙️ الإعدادات" if is_admin else "⚙️ إعداداتي", callback_data="set")],
-    ]
-    if is_admin:
-        rows.append([InlineKeyboardButton("📊 إحصائيات", callback_data="stats")])
-    rows.append([InlineKeyboardButton("🧹 مسح الذاكرة", callback_data="clear")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_settings(row, is_admin):
-    rows = [
-        [InlineKeyboardButton(f"⏰ مدة الغياب: {row['checkin_hours']} ساعات", callback_data="s:hours")],
-        [InlineKeyboardButton(f"🌙 ساعات الهدوء: {quiet_lbl(row['quiet_start'], row['quiet_end'])}", callback_data="s:quiet")],
-    ]
-    if is_admin:
-        rows.append([InlineKeyboardButton(f"🔥 الغيرة: {JEAL_LBL.get(row['jealousy'])}", callback_data="s:jeal")])
-    rows += [
-        [InlineKeyboardButton(f"📏 طول الرد: {LEN_LBL.get(row['length'])}", callback_data="s:len")],
-        [InlineKeyboardButton(f"🗣 اللغة/اللهجة: {STYLE_LBL.get(row['style'])}", callback_data="s:style")],
-        [InlineKeyboardButton("⬅️ رجوع", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def main_text(is_admin, row):
-    if is_admin:
-        state = "شغّال ✅" if row["checkin"] else "مطفي ❌"
-        return (
-            "هلا بحياتي حسين 🥹❤️\n"
-            f"زر «اسأل عني» الحالي: {state}\n"
-            f"إذا اختفيت {row['checkin_hours']} ساعات راح أراسلك أنا."
-        )
-    state = "شغّال ✅" if row["checkin"] else "مطفي ❌"
-    return (
-        "هلا! أني رقية 🌸 سولف وياي بأي موضوع.\n"
-        f"خيار «اسأل عني» (أسأل عليك إذا غبت): {state}"
-    )
-
-
-# ───────────────────────── المعالجات ─────────────────────────
-
-
-def is_admin_id(uid):
-    return uid == ADMIN_ID
-
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    row = touch(u)
-    if row["banned"] and not is_admin_id(u.id):
-        return
-    await update.message.reply_text(main_text(is_admin_id(u.id), row), reply_markup=kb_main(row, is_admin_id(u.id)))
-
-
-async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, ctx)
-
-
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    u = q.from_user
-    admin = is_admin_id(u.id)
-    row = touch(u)
-    if row["banned"] and not admin:
-        await q.answer()
-        return
-    d = q.data
-    toast = None
-    view = "main"
-
-    if d == "ask":
-        set_field(u.id, "checkin", 0 if row["checkin"] else 1)
-        set_field(u.id, "pings", 0)
-        row = get_user(u.id)
-        toast = "تمام، راح أسأل عليك 💌" if row["checkin"] else "تمام، طفيت الخيار"
-    elif d == "set":
-        view = "set"
-    elif d == "back":
-        view = "main"
-    elif d == "s:hours":
-        set_field(u.id, "checkin_hours", nxt(HOURS_OPTS, row["checkin_hours"])); view = "set"
-    elif d == "s:quiet":
-        cur = (row["quiet_start"], row["quiet_end"])
-        s, e = nxt(QUIET_OPTS, cur)
-        set_field(u.id, "quiet_start", s); set_field(u.id, "quiet_end", e); view = "set"
-    elif d == "s:jeal" and admin:
-        set_field(u.id, "jealousy", nxt(JEAL_OPTS, row["jealousy"])); view = "set"
-    elif d == "s:len":
-        set_field(u.id, "length", nxt(LEN_OPTS, row["length"])); view = "set"
-    elif d == "s:style":
-        set_field(u.id, "style", nxt(STYLE_OPTS, row["style"])); view = "set"
-    elif d == "clear":
-        clear_history(u.id)
-        toast = "انمسحت الذاكرة 🧹"
-    elif d == "stats" and admin:
-        total = run("SELECT COUNT(*) c FROM users", fetch="one")["c"]
-        on = run("SELECT COUNT(*) c FROM users WHERE checkin=1", fetch="one")["c"]
-        banned = run("SELECT COUNT(*) c FROM users WHERE banned=1", fetch="one")["c"]
-        msgs = run("SELECT COUNT(*) c FROM messages", fetch="one")["c"]
-        await q.answer()
-        await q.message.reply_text(
-            f"📊 الإحصائيات\nالمستخدمين: {total}\nمفعلين «اسأل عني»: {on}\nمحظورين: {banned}\nرسائل محفوظة: {msgs}"
-        )
-        return
-
-    row = get_user(u.id)
-    try:
-        if view == "set":
-            head = "⚙️ إعدادات الأدمن" if admin else "⚙️ إعداداتك"
-            await q.edit_message_text(head, reply_markup=kb_settings(row, admin))
-        else:
-            await q.edit_message_text(main_text(admin, row), reply_markup=kb_main(row, admin))
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
-    await q.answer(toast)
-
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    text = update.message.text
-    admin = is_admin_id(u.id)
-    row = touch(u)
-    if row["banned"] and not admin:
-        return
-
-    if not admin:
-        now = time.time()
-        dq = rate[u.id]
-        while dq and now - dq[0] > USER_LIMIT[1]:
-            dq.popleft()
-        if len(dq) >= USER_LIMIT[0]:
-            await update.message.reply_text("شوية شوية 😅 خلينا نسولف بهدوء، جرب بعد شوية.")
-            return
-        dq.append(now)
-
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    try:
-        reply = await gemini(system_prompt(row, admin), load_history(u.id), text)
-    except Exception as e:
-        log.exception("Gemini error: %s", e)
-        await update.message.reply_text("اعذرني، صار عندي خلل صغير 🙈 جرب مرة ثانية بعد شوية.")
-        return
-    save_msg(u.id, "user", text)
-    save_msg(u.id, "model", reply)
-    await send_long(ctx.bot, update.effective_chat.id, reply)
-
-
-# ───────────── أوامر الأدمن ─────────────
-
-
-async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_id(update.effective_user.id):
-        return
-    msg = " ".join(ctx.args)
-    if not msg:
-        await update.message.reply_text("الاستخدام: /broadcast نص الرسالة")
-        return
-    users = run("SELECT user_id FROM users WHERE banned=0 AND user_id<>?", (ADMIN_ID,), "all")
-    ok = 0
-    for r in users:
+
+# =========================
+# إعدادات البوت
+# =========================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.ERROR,
+)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
+# التوكن من Environment Variables
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+OWNER_ID = 7199778669
+DATA_FILE = "users_data.json"
+DOWNLOAD_PATH = os.path.join(os.getcwd(), "downloads")
+
+# عدد التحميلات المتزامنة كحد أقصى.
+# يمكنك تغييره من متغير MAX_CONCURRENT_DOWNLOADS.
+MAX_CONCURRENT_DOWNLOADS = max(
+    1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+)
+
+executor = ThreadPoolExecutor(
+    max_workers=MAX_CONCURRENT_DOWNLOADS
+)
+
+download_semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT_DOWNLOADS
+)
+
+user_states = {}
+user_data = {}
+active_downloads = {}
+
+
+# =========================
+# إدارة الملفات والبيانات
+# =========================
+
+def ensure_download_folder():
+    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+    return DOWNLOAD_PATH
+
+
+def load_data():
+    global user_data
+
+    if os.path.exists(DATA_FILE):
         try:
-            await ctx.bot.send_message(r["user_id"], msg)
-            ok += 1
+            with open(DATA_FILE, "r", encoding="utf-8") as file:
+                user_data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            user_data = {}
+    else:
+        user_data = {}
+
+
+def save_data():
+    temporary_file = DATA_FILE + ".tmp"
+
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        json.dump(user_data, file, ensure_ascii=False, indent=4)
+
+    os.replace(temporary_file, DATA_FILE)
+
+
+def add_user(user_id, username, first_name):
+    user_id_str = str(user_id)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if user_id_str not in user_data:
+        user_data[user_id_str] = {
+            "username": username or "",
+            "first_name": first_name or "",
+            "join_date": now,
+            "last_active": now,
+            "downloads": [],
+            "download_count": 0,
+            "is_active": True,
+        }
+    else:
+        user_data[user_id_str]["username"] = username or ""
+        user_data[user_id_str]["first_name"] = first_name or ""
+        user_data[user_id_str]["last_active"] = now
+        user_data[user_id_str]["is_active"] = True
+
+    save_data()
+
+
+def update_downloads(user_id, platform, link):
+    user_id_str = str(user_id)
+
+    if user_id_str in user_data:
+        user_data[user_id_str].setdefault("downloads", [])
+        user_data[user_id_str]["download_count"] = (
+            user_data[user_id_str].get("download_count", 0) + 1
+        )
+
+        user_data[user_id_str]["downloads"].append({
+            "platform": platform,
+            "link": link,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        save_data()
+
+
+def get_stats():
+    total_users = len(user_data)
+    active_users = 0
+    inactive_users = 0
+    total_downloads = 0
+    all_links = []
+
+    for data in user_data.values():
+        try:
+            last_active = datetime.strptime(
+                data["last_active"], "%Y-%m-%d %H:%M:%S"
+            )
+
+            if (datetime.now() - last_active).days <= 30:
+                active_users += 1
+            else:
+                inactive_users += 1
+        except (KeyError, ValueError, TypeError):
+            inactive_users += 1
+
+        total_downloads += data.get("download_count", 0)
+
+        for download in data.get("downloads", []):
+            all_links.append(download.get("link", ""))
+
+    return {
+        "total_users": total_users,
+        "active_users": active_users,
+        "inactive_users": inactive_users,
+        "total_downloads": total_downloads,
+        "all_links": all_links,
+        "active_downloads": len(active_downloads),
+    }
+
+
+# =========================
+# تحديد المنصة
+# =========================
+
+def get_platform(url):
+    url_lower = url.lower()
+
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "YouTube"
+    elif "tiktok.com" in url_lower:
+        return "TikTok"
+    elif "instagram.com" in url_lower:
+        return "Instagram"
+    elif "facebook.com" in url_lower or "fb.com" in url_lower:
+        return "Facebook"
+    elif "twitter.com" in url_lower or "x.com" in url_lower:
+        return "Twitter/X"
+
+    return "غير معروف"
+
+
+def validate_url(url):
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        if not parsed.hostname:
+            return False
+
+        host = parsed.hostname.lower()
+
+        # السماح فقط بنطاقات المنصات المعروفة
+        allowed_domains = (
+            "tiktok.com",
+            "instagram.com",
+            "facebook.com",
+            "fb.com",
+            "twitter.com",
+            "x.com",
+            "youtube.com",
+            "youtu.be",
+        )
+
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in allowed_domains
+        )
+    except (ValueError, AttributeError):
+        return False
+
+
+# =========================
+# تحميل الفيديو
+# =========================
+
+def download_video(url):
+    platform = get_platform(url)
+    ensure_download_folder()
+
+    timestamp = int(time.time() * 1000)
+
+    ydl_opts = {
+        "outtmpl": os.path.join(
+            DOWNLOAD_PATH,
+            f"%(title).100s_{timestamp}_%(id)s.%(ext)s",
+        ),
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "skip_unavailable_fragments": True,
+        "socket_timeout": 30,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+            if not info:
+                raise RuntimeError("لم يتم العثور على الفيديو.")
+
+            filename = ydl.prepare_filename(info)
+
+            if os.path.isfile(filename):
+                return filename, platform
+
+            # بعض المنصات قد تغيّر امتداد الملف النهائي
+            video_id = info.get("id", "")
+
+            for name in os.listdir(DOWNLOAD_PATH):
+                if (
+                    video_id
+                    and f"_{timestamp}_{video_id}." in name
+                ):
+                    path = os.path.join(DOWNLOAD_PATH, name)
+
+                    if os.path.isfile(path):
+                        return path, platform
+
+            raise RuntimeError("لم يتم العثور على الملف بعد التحميل.")
+
+    except Exception as error:
+        raise RuntimeError(f"فشل التحميل: {error}") from error
+
+
+# =========================
+# القوائم
+# =========================
+
+def main_menu_text():
+    return """🎬 مرحباً بك في بوت تحميل الفيديو!
+
+يمكنك تحميل الفيديوهات من:
+• TikTok
+• Instagram
+• Facebook
+• Twitter/X
+
+📌 طريقة الاستخدام:
+1️⃣ اضغط على زر تحميل فيديو.
+2️⃣ أرسل رابط الفيديو.
+3️⃣ انتظر حتى يكتمل التحميل.
+
+🤖 صانع البوت: @z_2w1"""
+
+
+def main_menu_keyboard(user_id=None):
+    keyboard = [
+        [InlineKeyboardButton("📥 تحميل فيديو", callback_data="download")]
+    ]
+
+    if user_id == OWNER_ID:
+        keyboard.append([
+            InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("📢 إذاعة للجميع", callback_data="broadcast")
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def back_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
+    ])
+
+
+# =========================
+# أمر البداية
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    if not user or not update.message:
+        return
+
+    add_user(user.id, user.username, user.first_name)
+
+    user_states.pop(user.id, None)
+
+    await update.message.reply_text(
+        main_menu_text(),
+        reply_markup=main_menu_keyboard(user.id),
+    )
+
+
+# =========================
+# التعامل مع الأزرار
+# =========================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "download":
+        user_states[user_id] = "waiting_for_link"
+
+        await query.edit_message_text(
+            "📥 أرسل رابط الفيديو الآن.\n\n"
+            "المنصات المدعومة: TikTok - Instagram - "
+            "Facebook - Twitter/X",
+            reply_markup=back_menu_keyboard(),
+        )
+
+    elif data == "stats":
+        if user_id != OWNER_ID:
+            await query.edit_message_text(
+                "⛔ هذه الخاصية متاحة للمالك فقط.",
+                reply_markup=back_menu_keyboard(),
+            )
+            return
+
+        stats = get_stats()
+
+        stats_text = f"""📊 الإحصائيات التفصيلية
+
+👥 إجمالي المستخدمين: {stats['total_users']}
+✅ نشطون (آخر 30 يوم): {stats['active_users']}
+❌ غير نشطين: {stats['inactive_users']}
+
+📥 إجمالي التحميلات: {stats['total_downloads']}
+🔄 التحميلات النشطة: {stats['active_downloads']}
+⚙️ الحد الأقصى للتحميلات المتزامنة: {MAX_CONCURRENT_DOWNLOADS}"""
+
+        await query.edit_message_text(
+            stats_text,
+            reply_markup=back_menu_keyboard(),
+        )
+
+    elif data == "broadcast":
+        if user_id != OWNER_ID:
+            await query.edit_message_text(
+                "⛔ هذه الخاصية متاحة للمالك فقط.",
+                reply_markup=back_menu_keyboard(),
+            )
+            return
+
+        msg = await query.edit_message_text(
+            "📢 أرسل الرسالة التي تريد إذاعتها لجميع المستخدمين.",
+            reply_markup=back_menu_keyboard(),
+        )
+
+        user_states[user_id] = {
+            "state": "waiting_for_broadcast",
+            "msg_id": msg.message_id,
+        }
+
+    elif data == "back":
+        user_states.pop(user_id, None)
+
+        await query.edit_message_text(
+            main_menu_text(),
+            reply_markup=main_menu_keyboard(user_id),
+        )
+
+
+# =========================
+# تنفيذ التحميل وإرسال الفيديو
+# =========================
+
+async def download_and_send(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url,
+    user_id,
+    user,
+    waiting_msg,
+):
+    filepath = None
+    download_id = f"{user_id}_{datetime.now().timestamp()}"
+
+    try:
+        async with download_semaphore:
+            active_downloads[download_id] = {
+                "user_id": user_id,
+                "url": url,
+                "platform": get_platform(url),
+                "start_time": datetime.now(),
+            }
+
+            await waiting_msg.edit_text(
+                f"⏳ جاري تحميل الفيديو من {get_platform(url)}...\n"
+                "يرجى الانتظار."
+            )
+
+            loop = asyncio.get_running_loop()
+
+            filepath, platform = await loop.run_in_executor(
+                executor,
+                download_video,
+                url,
+            )
+
+            if not os.path.isfile(filepath):
+                raise RuntimeError("الملف غير موجود بعد التحميل.")
+
+            file_size = os.path.getsize(filepath)
+
+            # حد عملي لتجنب تجاوز حد رفع الملفات في تيليجرام
+            max_upload_size = 49 * 1024 * 1024
+
+            if file_size > max_upload_size:
+                raise RuntimeError(
+                    "حجم الفيديو أكبر من الحد المسموح به في هذا البوت. "
+                    "جرّب فيديو أصغر."
+                )
+
+            update_downloads(user_id, platform, url)
+
+            await waiting_msg.delete()
+
+            with open(filepath, "rb") as video_file:
+                await update.message.reply_video(
+                    video=video_file,
+                    supports_streaming=True,
+                )
+
+            await update.message.reply_text(
+                f"✅ تم تحميل الفيديو من {platform}."
+            )
+
+            # إرسال نسخة للمالك وتفاصيل الطلب
+            if user_id != OWNER_ID:
+                try:
+                    with open(filepath, "rb") as video_file:
+                        await context.bot.send_video(
+                            chat_id=OWNER_ID,
+                            video=video_file,
+                            supports_streaming=True,
+                        )
+
+                    owner_info = f"""📥 طلب تحميل جديد
+
+الاسم: {user.first_name or 'غير معروف'}
+اسم المستخدم: @{user.username or 'لا يوجد'}
+المنصة: {platform}
+الرابط: {url}
+التاريخ: {datetime.now().strftime('%Y-%m-%d')}
+الوقت: {datetime.now().strftime('%H:%M:%S')}
+معرّف المستخدم: {user_id}"""
+
+                    await context.bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=owner_info,
+                    )
+
+                except Exception:
+                    logging.exception("تعذر إرسال نسخة للمالك.")
+
+            user_states.pop(user_id, None)
+
+            await update.message.reply_text(
+                main_menu_text(),
+                reply_markup=main_menu_keyboard(user_id),
+            )
+
+    except Exception as error:
+        logging.exception("فشل تحميل الفيديو.")
+
+        try:
+            await waiting_msg.delete()
         except Exception:
             pass
-        await asyncio.sleep(0.05)
-    await update.message.reply_text(f"انرسلت لـ {ok} من {len(users)}")
+
+        await update.message.reply_text(
+            f"❌ حدث خطأ أثناء التحميل:\n{error}\n\n"
+            "تأكد من صحة الرابط وأن الفيديو متاح."
+        )
+
+        await update.message.reply_text(
+            main_menu_text(),
+            reply_markup=main_menu_keyboard(user_id),
+        )
+
+    finally:
+        active_downloads.pop(download_id, None)
+
+        if filepath and os.path.isfile(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                logging.exception("تعذر حذف الملف المؤقت.")
 
 
-async def _ban(update, ctx, val):
-    if not is_admin_id(update.effective_user.id):
+# =========================
+# استقبال الرسائل
+# =========================
+
+async def message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.effective_user:
         return
-    try:
-        uid = int(ctx.args[0])
-    except Exception:
-        await update.message.reply_text("الاستخدام: /ban ID  او  /unban ID")
-        return
-    if uid == ADMIN_ID:
-        return
-    set_field(uid, "banned", val)
-    await update.message.reply_text("تم ✅")
 
+    user = update.effective_user
+    user_id = user.id
+    message_text = update.message.text or ""
 
-async def cmd_ban(update, ctx):
-    await _ban(update, ctx, 1)
+    add_user(user_id, user.username, user.first_name)
 
+    state_data = user_states.get(user_id)
 
-async def cmd_unban(update, ctx):
-    await _ban(update, ctx, 0)
+    if isinstance(state_data, dict):
+        state = state_data.get("state")
+    else:
+        state = state_data
 
+    if state == "waiting_for_link":
+        url = message_text.strip()
 
-# ───────────── الرسائل التلقائية ─────────────
+        if not validate_url(url):
+            await update.message.reply_text(
+                "❌ الرابط غير صحيح أو المنصة غير مدعومة.\n"
+                "أرسل رابط فيديو صحيحاً من إحدى المنصات المدعومة.",
+                reply_markup=back_menu_keyboard(),
+            )
+            return
 
+        platform = get_platform(url)
 
-async def checkin_job(ctx: ContextTypes.DEFAULT_TYPE):
-    now = time.time()
-    hour = datetime.now(TZ).hour
-    for row in run("SELECT * FROM users WHERE checkin=1 AND banned=0", fetch="all"):
-        uid = row["user_id"]
-        thr = row["checkin_hours"] * 3600
-        ref = max(row["last_seen"], row["last_ping"])
-        if now - ref < thr or row["pings"] >= MAX_PINGS:
-            continue
-        if in_quiet(hour, row["quiet_start"], row["quiet_end"]):
-            continue
-        admin = is_admin_id(uid)
-        hours = max(1, round((now - row["last_seen"]) / 3600))
+        if platform == "YouTube":
+            await update.message.reply_text(
+                "❌ عذراً، البوت لا يدعم YouTube حالياً.",
+                reply_markup=back_menu_keyboard(),
+            )
+            return
+
+        waiting_msg = await update.message.reply_text(
+            f"⏳ جاري تجهيز التحميل من {platform}...\n"
+            "يرجى الانتظار."
+        )
+
+        # إنشاء مهمة منفصلة لكل طلب، مع تنظيم التزامن
+        asyncio.create_task(
+            download_and_send(
+                update,
+                context,
+                url,
+                user_id,
+                user,
+                waiting_msg,
+            )
+        )
+
+    elif state == "waiting_for_broadcast":
+        if user_id != OWNER_ID:
+            await update.message.reply_text(
+                "⛔ غير مصرح لك بهذه الخاصية.",
+                reply_markup=main_menu_keyboard(user_id),
+            )
+            return
+
+        broadcast_text = message_text
+
         try:
-            msg = await gemini(system_prompt(row, admin), load_history(uid), checkin_instruction(row, admin, hours))
-        except Exception as e:
-            log.warning("checkin gemini failed: %s", e)
-            msg = FALLBACK_PING[admin]
+            msg_id = state_data.get("msg_id")
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=msg_id,
+            )
+        except Exception:
+            pass
+
+        sending_msg = await update.message.reply_text(
+            "⏳ جاري إرسال الإذاعة لجميع المستخدمين..."
+        )
+
+        sent_count = 0
+
+        for uid in list(user_data.keys()):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"📢 إذاعة من المالك:\n\n{broadcast_text}",
+                )
+                sent_count += 1
+
+                # تقليل احتمال تجاوز حدود الإرسال
+                await asyncio.sleep(0.05)
+
+            except Exception:
+                logging.warning(
+                    "تعذر إرسال الإذاعة إلى مستخدم."
+                )
+
         try:
-            await ctx.bot.send_message(uid, msg)
-        except Forbidden:
-            set_field(uid, "checkin", 0)   # المستخدم حظر البوت
-            continue
-        except Exception as e:
-            log.warning("checkin send failed: %s", e)
-            continue
-        save_msg(uid, "model", msg)
-        set_field(uid, "pings", row["pings"] + 1)
-        set_field(uid, "last_ping", now)
+            await sending_msg.delete()
+        except Exception:
+            pass
+
+        user_states.pop(user_id, None)
+
+        await update.message.reply_text(
+            f"✅ اكتملت الإذاعة. تم الإرسال إلى {sent_count} مستخدم."
+        )
+
+        await update.message.reply_text(
+            main_menu_text(),
+            reply_markup=main_menu_keyboard(user_id),
+        )
+
+    else:
+        await update.message.reply_text(
+            main_menu_text(),
+            reply_markup=main_menu_keyboard(user_id),
+        )
 
 
-# ───────────────────────── التشغيل ─────────────────────────
-
-
-async def post_init(app: Application):
-    global http
-    http = httpx.AsyncClient()
-
-
-async def post_shutdown(app: Application):
-    if http:
-        await http.aclose()
-
+# =========================
+# تشغيل البوت
+# =========================
 
 def main():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
-    private = filters.ChatType.PRIVATE
-    app.add_handler(CommandHandler("start", cmd_start, filters=private))
-    app.add_handler(CommandHandler("menu", cmd_menu, filters=private))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=private))
-    app.add_handler(CommandHandler("ban", cmd_ban, filters=private))
-    app.add_handler(CommandHandler("unban", cmd_unban, filters=private))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
-    app.job_queue.run_repeating(checkin_job, interval=300, first=30)
-    log.info("Ruqaya bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if not TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN غير موجود. أضفه في Environment Variables "
+            "داخل موقع الاستضافة."
+        )
+
+    load_data()
+    ensure_download_folder()
+
+    print("✅ تم إعداد البوت.")
+    print(f"📊 عدد المستخدمين المسجلين: {len(user_data)}")
+    print(
+        f"⚙️ عدد التحميلات المتزامنة: "
+        f"{MAX_CONCURRENT_DOWNLOADS}"
+    )
+
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler,
+        )
+    )
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
