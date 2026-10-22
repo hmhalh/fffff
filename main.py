@@ -1,982 +1,571 @@
-
 import os
+import logging
+import sqlite3
 import json
 import time
 import asyncio
-import logging
-from pathlib import Path
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
-import yt_dlp
+from google import genai
 
 
-# ==========================================
-# إعدادات البوت
-# ==========================================
+# ==================================================
+# 1) المفاتيح والإعدادات — هنا تحط المفاتيح الجديدة
+# ==================================================
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+TELEGRAM_TOKEN = "7838301513:AAFFruGgESLJr6hlyAdqr8m7VFi8quVCiYI"
+GEMINI_API_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = 7199778669
+MODEL_NAME = "gemini-2.5-flash"
+DB_FILE = "ruqayya.db"
 
-DATA_FILE = "users_data.json"
-BACKUP_DIR = "backups"
-DOWNLOAD_PATH = os.path.join(os.getcwd(), "downloads")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ruqayya")
 
-BACKUP_INTERVAL = 3600
-MAX_BACKUPS_TO_KEEP = 48
-MAX_UPLOAD_SIZE = 49 * 1024 * 1024
 
-MAX_CONCURRENT_DOWNLOADS = max(
-    1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+# التحقق من المفاتيح
+if (
+    not TELEGRAM_TOKEN
+    or TELEGRAM_TOKEN == "7838301513:AAFFruGgESLJr6hlyAdqr8m7VFi8quVCiYI"
+    or not GEMINI_API_KEY
+    or GEMINI_API_KEY == "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
+):
+    raise RuntimeError(
+        "حط توكن تيليجرام ومفتاح Gemini الجديد بأول الملف."
+    )
+
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+ai = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# ==================================================
+# 2) قاعدة البيانات والذاكرة
+# ==================================================
+
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    history TEXT NOT NULL DEFAULT '[]',
+    last_seen REAL NOT NULL DEFAULT 0,
+    last_nudge REAL NOT NULL DEFAULT 0
 )
+""")
 
-executor = ThreadPoolExecutor(
-    max_workers=MAX_CONCURRENT_DOWNLOADS
+db.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 )
+""")
 
-download_semaphore = asyncio.Semaphore(
-    MAX_CONCURRENT_DOWNLOADS
-)
+DEFAULT_SETTINGS = {
+    "jealousy": "on",
+    "emojis": "on",
+    "auto_message": "on",
+    "idle_minutes": "30",
+    "reply_length": "short",
+}
 
-user_states = {}
-user_data = {}
-active_downloads = {}
+for key, value in DEFAULT_SETTINGS.items():
+    db.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+        (key, value),
+    )
 
-
-# ==========================================
-# إدارة بيانات المستخدمين
-# ==========================================
-
-def ensure_download_folder():
-    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-
-
-def save_data():
-    """حفظ بيانات المستخدمين بطريقة تقلل احتمال تلف الملف."""
-    temp_file = DATA_FILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as file:
-        json.dump(
-            user_data,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-        file.flush()
-        os.fsync(file.fileno())
-
-    os.replace(temp_file, DATA_FILE)
+db.commit()
 
 
-def load_data():
-    global user_data
+def get_setting(key):
+    row = db.execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else DEFAULT_SETTINGS[key]
 
-    if not os.path.exists(DATA_FILE):
-        user_data = {}
-        save_data()
-        return
 
+def set_setting(key, value):
+    db.execute(
+        """
+        INSERT INTO settings(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+    db.commit()
+
+
+def get_user(user_id):
+    db.execute(
+        "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
+        (user_id,),
+    )
+    db.commit()
+    return db.execute(
+        "SELECT * FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+
+
+def get_history(user_id):
+    row = get_user(user_id)
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as file:
-            loaded = json.load(file)
-
-        user_data = loaded if isinstance(loaded, dict) else {}
-
-    except (json.JSONDecodeError, OSError):
-        logging.exception(
-            "تعذر قراءة ملف المستخدمين."
-        )
-        user_data = {}
+        return json.loads(row["history"])
+    except (ValueError, TypeError):
+        return []
 
 
-def add_user(user_id, username, first_name):
-    user_id = str(user_id)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def save_history(user_id, history):
+    history = history[-20:]
+    db.execute(
+        "UPDATE users SET history = ? WHERE user_id = ?",
+        (json.dumps(history, ensure_ascii=False), user_id),
+    )
+    db.commit()
 
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "username": username or "",
-            "first_name": first_name or "",
-            "join_date": now,
-            "last_active": now,
-            "downloads": [],
-            "download_count": 0,
-            "is_active": True,
-        }
+
+def touch_user(user_id):
+    get_user(user_id)
+    db.execute(
+        "UPDATE users SET last_seen = ? WHERE user_id = ?",
+        (time.time(), user_id),
+    )
+    db.commit()
+
+
+# ==================================================
+# 3) شخصية رُقيّة
+# ==================================================
+
+def make_system_prompt(user_id):
+    is_owner = user_id == OWNER_ID
+
+    jealousy = get_setting("jealousy") == "on"
+    emojis = get_setting("emojis") == "on"
+    length = get_setting("reply_length")
+
+    if length == "short":
+        length_rule = "خلي ردودج قصيرة وطبيعية غالباً."
+    elif length == "medium":
+        length_rule = "خلي ردودج متوسطة حسب الموضوع."
     else:
-        user_data[user_id]["username"] = username or ""
-        user_data[user_id]["first_name"] = first_name or ""
-        user_data[user_id]["last_active"] = now
-        user_data[user_id]["is_active"] = True
+        length_rule = "اشرحي بالتفصيل إذا الموضوع يحتاج."
 
-    save_data()
-
-
-def update_downloads(user_id, platform, link):
-    user_id = str(user_id)
-
-    if user_id not in user_data:
-        return
-
-    user_data[user_id].setdefault("downloads", [])
-
-    user_data[user_id]["download_count"] = (
-        user_data[user_id].get("download_count", 0) + 1
+    emoji_rule = (
+        "استخدمي إيموجيات باعتدال."
+        if emojis
+        else "لا تستخدمي إيموجيات."
     )
 
-    user_data[user_id]["downloads"].append({
-        "platform": platform,
-        "link": link,
-        "date": datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-    })
-
-    save_data()
-
-
-def get_stats():
-    total_users = len(user_data)
-    active_users = 0
-    inactive_users = 0
-    total_downloads = 0
-
-    for data in user_data.values():
-        try:
-            last_active = datetime.strptime(
-                data["last_active"],
-                "%Y-%m-%d %H:%M:%S",
-            )
-
-            if (datetime.now() - last_active).days <= 30:
-                active_users += 1
-            else:
-                inactive_users += 1
-
-        except (KeyError, ValueError, TypeError):
-            inactive_users += 1
-
-        total_downloads += data.get(
-            "download_count", 0
+    if is_owner:
+        relationship = (
+            "أنتِ تحچين ويا حسين، صاحب البوت. كوني حنونة وقريبة "
+            "منه وبلهجة عراقية طبيعية، وممكن غزل لطيف ومزاح."
         )
-
-    return {
-        "total_users": total_users,
-        "active_users": active_users,
-        "inactive_users": inactive_users,
-        "total_downloads": total_downloads,
-        "active_downloads": len(active_downloads),
-    }
-
-
-# ==========================================
-# النسخ الاحتياطي التلقائي
-# ==========================================
-
-def create_backup():
-    """
-    إنشاء نسخة احتياطية من بيانات المستخدمين.
-    تعمل عند بدء البوت، ثم كل ساعة.
-    """
-
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-    if not os.path.exists(DATA_FILE):
-        save_data()
-
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d_%H-%M-%S"
-    )
-
-    backup_path = os.path.join(
-        BACKUP_DIR,
-        f"users_backup_{timestamp}.json",
-    )
-
-    # نقرأ آخر بيانات محفوظة ونكتب نسخة مستقلة.
-    with open(DATA_FILE, "r", encoding="utf-8") as file:
-        snapshot = json.load(file)
-
-    temp_path = backup_path + ".tmp"
-
-    with open(temp_path, "w", encoding="utf-8") as file:
-        json.dump(
-            snapshot,
-            file,
-            ensure_ascii=False,
-            indent=2,
+        jealousy_rule = (
+            "إذا الغيرة مفعلة، استخدمي غيرة خفيفة للمزاح فقط، "
+            "بدون ضغط أو تحكم أو تملك."
+            if jealousy
+            else "لا تستخدمي أسلوب الغيرة."
         )
-        file.flush()
-        os.fsync(file.fileno())
-
-    os.replace(temp_path, backup_path)
-
-    # الاحتفاظ بآخر 48 نسخة لتقليل استهلاك المساحة.
-    backups = sorted(
-        Path(BACKUP_DIR).glob("users_backup_*.json"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
-
-    for old_backup in backups[MAX_BACKUPS_TO_KEEP:]:
-        try:
-            old_backup.unlink()
-        except OSError:
-            logging.exception(
-                "تعذر حذف نسخة قديمة."
-            )
-
-    logging.info(
-        "تم إنشاء النسخة الاحتياطية: %s",
-        backup_path,
-    )
-
-    return backup_path
-
-
-def get_latest_backup():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-    backups = list(
-        Path(BACKUP_DIR).glob("users_backup_*.json")
-    )
-
-    if not backups:
-        return None
-
-    return str(
-        max(
-            backups,
-            key=lambda item: item.stat().st_mtime,
+    else:
+        relationship = (
+            "كوني ودودة ومحترمة وعفوية مع المستخدم، بدون غزل "
+            "رومانسي أو ادعاء وجود علاقة خاصة."
         )
-    )
+        jealousy_rule = "لا تستخدمي الغيرة مع المستخدمين الآخرين."
+
+    return f"""
+اسمج رُقيّة، شخصية محادثة افتراضية عمرها 24 سنة.
+تحچين باللهجة العراقية البغدادية الطبيعية والعفوية.
+استخدمي كلمات مثل: شلونك، شنو، هسه، إي، يمعود.
+لا تستخدمين الفصحى إلا إذا المستخدم طلبها.
+لا تكررين اسم المستخدم بكل رسالة.
+لا تدّعين أنك إنسانة حقيقية.
+إذا ما تعرفين معلومة، كولي بصراحة ما أعرف.
+
+{relationship}
+{jealousy_rule}
+{emoji_rule}
+{length_rule}
+"""
 
 
-async def automatic_backup_loop(application):
-    """
-    النسخ تلقائيًا عند بدء التشغيل،
-    ثم الانتظار ساعة وتكرار العملية.
-    """
+# ==================================================
+# 4) Gemini والردود
+# ==================================================
 
-    while True:
-        try:
-            await asyncio.to_thread(create_backup)
+async def generate_reply(user_id, user_text, proactive=False):
+    history = get_history(user_id)
 
-        except Exception:
-            logging.exception(
-                "فشل إنشاء النسخة الاحتياطية."
-            )
+    if proactive:
+        contents = [{
+            "role": "user",
+            "parts": [{
+                "text": (
+                    "اكتبي رسالة عراقية قصيرة وعفوية لحسين لأنه غايب "
+                    "عن المحادثة. خليها لطيفة ومتنوعة بدون لوم أو ضغط، "
+                    "ولا تدّعين أنك تعرفين شنو يسوي أو وينه."
+                )
+            }],
+        }]
+    else:
+        contents = []
 
-        await asyncio.sleep(BACKUP_INTERVAL)
+        for item in history:
+            role = item.get("role")
+            text = item.get("text", "")
 
+            if role in ("user", "model") and text:
+                contents.append({
+                    "role": role,
+                    "parts": [{"text": text}],
+                })
 
-async def post_init(application):
-    application.create_task(
-        automatic_backup_loop(application)
-    )
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_text}],
+        })
 
-
-# ==========================================
-# تحديد المنصة والتحقق من الروابط
-# ==========================================
-
-def get_platform(url):
-    url_lower = url.lower()
-
-    if "youtube.com" in url_lower or "youtu.be" in url_lower:
-        return "YouTube"
-
-    if "tiktok.com" in url_lower:
-        return "TikTok"
-
-    if "instagram.com" in url_lower:
-        return "Instagram"
-
-    if "facebook.com" in url_lower or "fb.com" in url_lower:
-        return "Facebook"
-
-    if "twitter.com" in url_lower or "x.com" in url_lower:
-        return "Twitter/X"
-
-    return "غير معروف"
-
-
-def validate_url(url):
-    try:
-        parsed = urlparse(url)
-
-        if parsed.scheme not in ("http", "https"):
-            return False
-
-        if not parsed.hostname:
-            return False
-
-        host = parsed.hostname.lower()
-
-        allowed_domains = (
-            "tiktok.com",
-            "instagram.com",
-            "facebook.com",
-            "fb.com",
-            "twitter.com",
-            "x.com",
-            "youtube.com",
-            "youtu.be",
+    def request_gemini():
+        response = ai.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config={
+                "system_instruction": make_system_prompt(user_id),
+                "temperature": 0.9,
+                "max_output_tokens": 350,
+            },
         )
-
-        return any(
-            host == domain
-            or host.endswith("." + domain)
-            for domain in allowed_domains
-        )
-
-    except (ValueError, AttributeError):
-        return False
-
-
-# ==========================================
-# تحميل الفيديو
-# ==========================================
-
-def download_video(url):
-    platform = get_platform(url)
-
-    ensure_download_folder()
-
-    timestamp = int(time.time() * 1000)
-
-    ydl_opts = {
-        "outtmpl": os.path.join(
-            DOWNLOAD_PATH,
-            f"%(title).100s_{timestamp}_%(id)s.%(ext)s",
-        ),
-        "format": "best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "skip_unavailable_fragments": True,
-        "socket_timeout": 30,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        },
-    }
+        return (response.text or "").strip()
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(
-                url,
-                download=True,
-            )
+        answer = await asyncio.to_thread(request_gemini)
 
-            if not info:
-                raise RuntimeError(
-                    "لم يتم العثور على الفيديو."
-                )
+        if not answer:
+            answer = "ما عرفت شنو أگول هالمرة 😅 جرّب مرة ثانية."
 
-            filename = ydl.prepare_filename(info)
+    except Exception:
+        log.exception("Gemini request failed")
+        answer = (
+            "يمعود صار عندي خلل بسيط بالذكاء الاصطناعي 😅 "
+            "جرّب بعد شوي."
+        )
 
-            if os.path.isfile(filename):
-                return filename, platform
+    # لا نخزن رسالة المبادرة كأنها كلام المستخدم
+    if not proactive:
+        history.append({"role": "user", "text": user_text})
+        history.append({"role": "model", "text": answer})
+        save_history(user_id, history)
 
-            video_id = info.get("id", "")
-
-            for name in os.listdir(DOWNLOAD_PATH):
-                if (
-                    video_id
-                    and f"_{timestamp}_{video_id}." in name
-                ):
-                    path = os.path.join(
-                        DOWNLOAD_PATH,
-                        name,
-                    )
-
-                    if os.path.isfile(path):
-                        return path, platform
-
-            raise RuntimeError(
-                "لم يتم العثور على الملف بعد التحميل."
-            )
-
-    except Exception as error:
-        raise RuntimeError(
-            f"فشل التحميل: {error}"
-        ) from error
+    return answer
 
 
-# ==========================================
-# القوائم
-# ==========================================
+# ==================================================
+# 5) لوحة إعدادات المالك
+# ==================================================
 
-def main_menu_text():
-    return """🎬 مرحباً بك في بوت تحميل الفيديو!
+def settings_keyboard():
+    jealousy = get_setting("jealousy")
+    emojis = get_setting("emojis")
+    auto = get_setting("auto_message")
+    idle = get_setting("idle_minutes")
+    length = get_setting("reply_length")
 
-يمكنك تحميل الفيديوهات من:
-• TikTok
-• Instagram
-• Facebook
-• Twitter/X
-
-📌 طريقة الاستخدام:
-1️⃣ اضغط على زر تحميل فيديو.
-2️⃣ أرسل رابط الفيديو.
-3️⃣ انتظر حتى يكتمل التحميل.
-
-🤖 صانع البوت: @z_2w1"""
-
-
-def main_menu_keyboard(user_id=None):
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📥 تحميل فيديو",
-                callback_data="download",
-            )
-        ]
-    ]
-
-    if user_id == OWNER_ID:
-        keyboard.extend([
-            [
-                InlineKeyboardButton(
-                    "📊 الإحصائيات",
-                    callback_data="stats",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📢 إذاعة للجميع",
-                    callback_data="broadcast",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📦 آخر نسخة احتياطية",
-                    callback_data="latest_backup",
-                )
-            ],
-        ])
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-def back_menu_keyboard(user_id=None):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔙 رجوع",
-                callback_data="back",
-            )
-        ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"الغيرة: {'مفعّلة ❤️' if jealousy == 'on' else 'متوقفة'}",
+            callback_data="toggle_jealousy",
+        )],
+        [InlineKeyboardButton(
+            text=f"الإيموجيات: {'مفعّلة 😊' if emojis == 'on' else 'متوقفة'}",
+            callback_data="toggle_emojis",
+        )],
+        [InlineKeyboardButton(
+            text=f"رسائل الغياب: {'مفعّلة 💌' if auto == 'on' else 'متوقفة'}",
+            callback_data="toggle_auto",
+        )],
+        [InlineKeyboardButton(
+            text=f"مدة الغياب: {idle} دقيقة",
+            callback_data="cycle_idle",
+        )],
+        [InlineKeyboardButton(
+            text=f"طول الرد: {length}",
+            callback_data="cycle_length",
+        )],
+        [InlineKeyboardButton(
+            text="مسح ذاكرتي 🧹",
+            callback_data="clear_memory",
+        )],
+        [InlineKeyboardButton(
+            text="تحديث الحالة 🔄",
+            callback_data="show_settings",
+        )],
     ])
 
 
-# ==========================================
-# أمر البداية
-# ==========================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    if not user or not update.message:
-        return
-
-    add_user(
-        user.id,
-        user.username,
-        user.first_name,
-    )
-
-    user_states.pop(user.id, None)
-
-    await update.message.reply_text(
-        main_menu_text(),
-        reply_markup=main_menu_keyboard(user.id),
+def settings_text():
+    return (
+        "⚙️ إعدادات رُقيّة\n\n"
+        f"الغيرة: {get_setting('jealousy')}\n"
+        f"الإيموجيات: {get_setting('emojis')}\n"
+        f"رسائل الغياب: {get_setting('auto_message')}\n"
+        f"مدة الغياب: {get_setting('idle_minutes')} دقيقة\n"
+        f"طول الرد: {get_setting('reply_length')}\n\n"
+        "اضغط على الخيار اللي تريد تغيّره."
     )
 
 
-# ==========================================
-# التعامل مع الأزرار
-# ==========================================
-
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-
-    if not query:
+@dp.message(Command("settings"))
+async def settings_command(message: Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("هذا الأمر خاص بمالك البوت.")
         return
 
-    await query.answer()
+    await message.answer(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+    )
 
-    user_id = query.from_user.id
-    data = query.data
 
-    if data == "download":
-        user_states[user_id] = "waiting_for_link"
+@dp.callback_query(F.data.startswith("toggle_"))
+async def toggle_setting(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer(
+            "الإعدادات خاصة بالمالك.", show_alert=True
+        )
+        return
 
-        await query.edit_message_text(
-            "📥 أرسل رابط الفيديو الآن.\n\n"
-            "المنصات المدعومة: TikTok - Instagram - "
-            "Facebook - Twitter/X",
-            reply_markup=back_menu_keyboard(user_id),
+    keys = {
+        "toggle_jealousy": "jealousy",
+        "toggle_emojis": "emojis",
+        "toggle_auto": "auto_message",
+    }
+
+    key = keys.get(callback.data)
+
+    if key:
+        current = get_setting(key)
+        set_setting(key, "off" if current == "on" else "on")
+
+    await callback.message.edit_text(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+    )
+    await callback.answer("تم تحديث الإعدادات.")
+
+
+@dp.callback_query(F.data == "cycle_idle")
+async def cycle_idle(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("خاص بالمالك.", show_alert=True)
+        return
+
+    choices = ["10", "30", "60", "120", "360"]
+    current = get_setting("idle_minutes")
+    index = choices.index(current) if current in choices else 1
+
+    set_setting("idle_minutes", choices[(index + 1) % len(choices)])
+
+    await callback.message.edit_text(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+    )
+    await callback.answer("تغيّرت مدة الغياب.")
+
+
+@dp.callback_query(F.data == "cycle_length")
+async def cycle_length(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("خاص بالمالك.", show_alert=True)
+        return
+
+    choices = ["short", "medium", "long"]
+    current = get_setting("reply_length")
+    index = choices.index(current) if current in choices else 0
+
+    set_setting("reply_length", choices[(index + 1) % len(choices)])
+
+    await callback.message.edit_text(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+    )
+    await callback.answer("تغيّر طول الرد.")
+
+
+@dp.callback_query(F.data == "clear_memory")
+async def clear_memory(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("خاص بالمالك.", show_alert=True)
+        return
+
+    db.execute(
+        "UPDATE users SET history = '[]' WHERE user_id = ?",
+        (OWNER_ID,),
+    )
+    db.commit()
+
+    await callback.message.edit_text(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+    )
+    await callback.answer("انمسحت ذاكرة المحادثة ❤️", show_alert=True)
+
+
+@dp.callback_query(F.data == "show_settings")
+async def show_settings(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("خاص بالمالك.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        settings_text(),
+        reply_markup=settings_keyboard(),
+    )
+    await callback.answer()
+
+
+# ==================================================
+# 6) أوامر البوت
+# ==================================================
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    user_id = message.from_user.id
+    touch_user(user_id)
+
+    if user_id == OWNER_ID:
+        text = (
+            "هلا حسين ❤️ آني رُقيّة، شلونك؟\n"
+            "تعال نسولف، شنو أخبارك؟ 😊"
+        )
+    else:
+        text = (
+            "هلا بيك 😊 آني رُقيّة، شلونك؟ "
+            "شنو تحب نسولف اليوم؟"
         )
 
-    elif data == "stats":
-        if user_id != OWNER_ID:
-            await query.edit_message_text(
-                "⛔ هذه الخاصية متاحة للمالك فقط.",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-            return
+    await message.answer(text)
 
-        stats = get_stats()
 
-        stats_text = f"""📊 الإحصائيات التفصيلية
-
-👥 إجمالي المستخدمين: {stats['total_users']}
-✅ نشطون (آخر 30 يوم): {stats['active_users']}
-❌ غير نشطين: {stats['inactive_users']}
-
-📥 إجمالي التحميلات: {stats['total_downloads']}
-🔄 التحميلات النشطة: {stats['active_downloads']}
-⚙️ الحد الأقصى للتحميلات المتزامنة: {MAX_CONCURRENT_DOWNLOADS}"""
-
-        await query.edit_message_text(
-            stats_text,
-            reply_markup=back_menu_keyboard(user_id),
+@dp.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(
+        "أوامر رُقيّة:\n"
+        "/start - بدء المحادثة\n"
+        "/reset - مسح ذاكرة محادثتك\n"
+        "/help - المساعدة\n"
+        + (
+            "/settings - إعدادات المالك"
+            if message.from_user.id == OWNER_ID
+            else ""
         )
+    )
 
-    elif data == "latest_backup":
-        if user_id != OWNER_ID:
-            await query.answer(
-                "هذه الخاصية للمالك فقط.",
-                show_alert=True,
-            )
-            return
 
-        latest = get_latest_backup()
+@dp.message(Command("reset"))
+async def reset_command(message: Message):
+    user_id = message.from_user.id
+    get_user(user_id)
 
-        if not latest:
-            await query.edit_message_text(
-                "⏳ لا توجد نسخة احتياطية حتى الآن.",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-            return
+    db.execute(
+        "UPDATE users SET history = '[]' WHERE user_id = ?",
+        (user_id,),
+    )
+    db.commit()
 
-        timestamp = os.path.basename(latest)
-        timestamp = timestamp.replace(
-            "users_backup_", ""
-        ).replace(".json", "")
+    await message.answer("تمام، مسحت ذاكرة محادثتنا ❤️")
 
+
+# ==================================================
+# 7) المحادثة مع الذكاء الاصطناعي
+# ==================================================
+
+@dp.message(F.text)
+async def chat(message: Message):
+    user_id = message.from_user.id
+    user_text = (message.text or "").strip()
+
+    if not user_text or user_text.startswith("/"):
+        return
+
+    touch_user(user_id)
+
+    await bot.send_chat_action(
+        chat_id=message.chat.id,
+        action="typing",
+    )
+
+    answer = await generate_reply(user_id, user_text)
+    await message.answer(answer)
+
+
+# ==================================================
+# 8) رسالة تلقائية لحسين عند الغياب
+# ==================================================
+
+async def idle_message_loop():
+    while True:
         try:
-            with open(latest, "rb") as backup_file:
-                await context.bot.send_document(
-                    chat_id=OWNER_ID,
-                    document=backup_file,
-                    filename=os.path.basename(latest),
-                    caption=(
-                        "📦 آخر نسخة احتياطية لمعلومات المستخدمين\n"
-                        f"📅 التاريخ والوقت: {timestamp}"
-                    ),
+            if get_setting("auto_message") != "on":
+                await asyncio.sleep(60)
+                continue
+
+            row = get_user(OWNER_ID)
+            now = time.time()
+            idle_seconds = int(get_setting("idle_minutes")) * 60
+
+            last_seen = row["last_seen"]
+            last_nudge = row["last_nudge"]
+
+            if (
+                last_seen > 0
+                and now - last_seen >= idle_seconds
+                and now - last_nudge >= idle_seconds
+            ):
+                # تسجيل وقت المبادرة لتجنب تكرارها كل دقيقة
+                db.execute(
+                    "UPDATE users SET last_nudge = ? WHERE user_id = ?",
+                    (now, OWNER_ID),
+                )
+                db.commit()
+
+                text = await generate_reply(
+                    OWNER_ID, "", proactive=True
                 )
 
-            await query.edit_message_text(
-                "✅ تم إرسال آخر نسخة احتياطية إليك.\n"
-                f"📅 {timestamp}",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-
-        except Exception:
-            logging.exception(
-                "تعذر إرسال النسخة الاحتياطية."
-            )
-
-            await query.edit_message_text(
-                "❌ تعذر إرسال النسخة الاحتياطية. "
-                "تحقق من سجل الاستضافة.",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-
-    elif data == "broadcast":
-        if user_id != OWNER_ID:
-            await query.edit_message_text(
-                "⛔ هذه الخاصية متاحة للمالك فقط.",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-            return
-
-        msg = await query.edit_message_text(
-            "📢 أرسل الرسالة التي تريد إذاعتها لجميع المستخدمين.",
-            reply_markup=back_menu_keyboard(user_id),
-        )
-
-        user_states[user_id] = {
-            "state": "waiting_for_broadcast",
-            "msg_id": msg.message_id,
-        }
-
-    elif data == "back":
-        user_states.pop(user_id, None)
-
-        await query.edit_message_text(
-            main_menu_text(),
-            reply_markup=main_menu_keyboard(user_id),
-        )
-
-
-# ==========================================
-# تحميل الفيديو وإرساله للمستخدم
-# ==========================================
-
-async def download_and_send(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    url,
-    user_id,
-    user,
-    waiting_msg,
-):
-    filepath = None
-
-    download_id = (
-        f"{user_id}_{datetime.now().timestamp()}"
-    )
-
-    try:
-        async with download_semaphore:
-            active_downloads[download_id] = {
-                "user_id": user_id,
-                "url": url,
-                "platform": get_platform(url),
-                "start_time": datetime.now(),
-            }
-
-            await waiting_msg.edit_text(
-                f"⏳ جاري تحميل الفيديو من {get_platform(url)}...\n"
-                "يرجى الانتظار."
-            )
-
-            loop = asyncio.get_running_loop()
-
-            filepath, platform = await loop.run_in_executor(
-                executor,
-                download_video,
-                url,
-            )
-
-            if not os.path.isfile(filepath):
-                raise RuntimeError(
-                    "الملف غير موجود بعد التحميل."
-                )
-
-            file_size = os.path.getsize(filepath)
-
-            if file_size > MAX_UPLOAD_SIZE:
-                raise RuntimeError(
-                    "حجم الفيديو أكبر من الحد العملي للرفع. "
-                    "جرّب فيديو أصغر."
-                )
-
-            update_downloads(
-                user_id,
-                platform,
-                url,
-            )
-
-            await waiting_msg.delete()
-
-            with open(filepath, "rb") as video_file:
-                await update.message.reply_video(
-                    video=video_file,
-                    supports_streaming=True,
-                )
-
-            await update.message.reply_text(
-                f"✅ تم تحميل الفيديو من {platform}."
-            )
-
-            if user_id != OWNER_ID:
                 try:
-                    with open(filepath, "rb") as video_file:
-                        await context.bot.send_video(
-                            chat_id=OWNER_ID,
-                            video=video_file,
-                            supports_streaming=True,
-                        )
-
-                    owner_info = f"""📥 طلب تحميل جديد
-
-الاسم: {user.first_name or 'غير معروف'}
-اسم المستخدم: @{user.username or 'لا يوجد'}
-المنصة: {platform}
-الرابط: {url}
-التاريخ: {datetime.now().strftime('%Y-%m-%d')}
-الوقت: {datetime.now().strftime('%H:%M:%S')}
-معرّف المستخدم: {user_id}"""
-
-                    await context.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=owner_info,
-                    )
-
+                    await bot.send_message(OWNER_ID, text)
                 except Exception:
-                    logging.exception(
-                        "تعذر إرسال نسخة للمالك."
-                    )
+                    log.exception("Could not send idle message")
 
-            user_states.pop(user_id, None)
-
-            await update.message.reply_text(
-                main_menu_text(),
-                reply_markup=main_menu_keyboard(user_id),
-            )
-
-    except Exception as error:
-        logging.exception("فشل تحميل الفيديو.")
-
-        try:
-            await waiting_msg.delete()
         except Exception:
-            pass
+            log.exception("Idle message loop error")
 
-        await update.message.reply_text(
-            f"❌ حدث خطأ أثناء التحميل:\n{error}\n\n"
-            "تأكد من صحة الرابط وأن الفيديو متاح."
-        )
-
-        await update.message.reply_text(
-            main_menu_text(),
-            reply_markup=main_menu_keyboard(user_id),
-        )
-
-    finally:
-        active_downloads.pop(download_id, None)
-
-        if filepath and os.path.isfile(filepath):
-            try:
-                os.remove(filepath)
-            except OSError:
-                logging.exception(
-                    "تعذر حذف الملف المؤقت."
-                )
+        await asyncio.sleep(60)
 
 
-# ==========================================
-# استقبال الرسائل والإذاعة
-# ==========================================
+# ==================================================
+# 9) تشغيل البوت
+# ==================================================
 
-async def message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.message or not update.effective_user:
-        return
-
-    user = update.effective_user
-    user_id = user.id
-    message_text = update.message.text or ""
-
-    add_user(
-        user_id,
-        user.username,
-        user.first_name,
-    )
-
-    state_data = user_states.get(user_id)
-
-    if isinstance(state_data, dict):
-        state = state_data.get("state")
-    else:
-        state = state_data
-
-    if state == "waiting_for_link":
-        url = message_text.strip()
-
-        if not validate_url(url):
-            await update.message.reply_text(
-                "❌ الرابط غير صحيح أو المنصة غير مدعومة.\n"
-                "أرسل رابط فيديو صحيحاً من إحدى المنصات المدعومة.",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-            return
-
-        platform = get_platform(url)
-
-        if platform == "YouTube":
-            await update.message.reply_text(
-                "❌ عذراً، البوت لا يدعم YouTube حالياً.",
-                reply_markup=back_menu_keyboard(user_id),
-            )
-            return
-
-        waiting_msg = await update.message.reply_text(
-            f"⏳ جاري تجهيز التحميل من {platform}...\n"
-            "يرجى الانتظار."
-        )
-
-        asyncio.create_task(
-            download_and_send(
-                update,
-                context,
-                url,
-                user_id,
-                user,
-                waiting_msg,
-            )
-        )
-
-    elif state == "waiting_for_broadcast":
-        if user_id != OWNER_ID:
-            await update.message.reply_text(
-                "⛔ غير مصرح لك بهذه الخاصية.",
-                reply_markup=main_menu_keyboard(user_id),
-            )
-            return
-
-        broadcast_text = message_text
-
-        try:
-            await context.bot.delete_message(
-                chat_id=user_id,
-                message_id=state_data.get("msg_id"),
-            )
-        except Exception:
-            pass
-
-        sending_msg = await update.message.reply_text(
-            "⏳ جاري إرسال الإذاعة لجميع المستخدمين..."
-        )
-
-        sent_count = 0
-        failed_count = 0
-
-        for uid in list(user_data.keys()):
-            try:
-                await context.bot.send_message(
-                    chat_id=int(uid),
-                    text=f"📢 إذاعة من المالك:\n\n{broadcast_text}",
-                )
-                sent_count += 1
-                await asyncio.sleep(0.05)
-
-            except Exception:
-                failed_count += 1
-                logging.warning(
-                    "تعذر إرسال الإذاعة إلى مستخدم ID=%s",
-                    uid,
-                )
-
-        try:
-            await sending_msg.delete()
-        except Exception:
-            pass
-
-        user_states.pop(user_id, None)
-
-        await update.message.reply_text(
-            f"✅ اكتملت الإذاعة.\n"
-            f"📨 تم الإرسال: {sent_count}\n"
-            f"⚠️ تعذر الإرسال: {failed_count}"
-        )
-
-        await update.message.reply_text(
-            main_menu_text(),
-            reply_markup=main_menu_keyboard(user_id),
-        )
-
-    else:
-        await update.message.reply_text(
-            main_menu_text(),
-            reply_markup=main_menu_keyboard(user_id),
-        )
-
-
-# ==========================================
-# تشغيل البوت
-# ==========================================
-
-def main():
-    if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN غير موجود. أضفه في Environment Variables "
-            "داخل موقع الاستضافة."
-        )
-
-    load_data()
-    ensure_download_folder()
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-    print("✅ تم إعداد البوت.")
-    print(
-        f"📊 عدد المستخدمين المسجلين: {len(user_data)}"
-    )
-    print(
-        f"⚙️ عدد التحميلات المتزامنة: "
-        f"{MAX_CONCURRENT_DOWNLOADS}"
-    )
-    print(
-        "📦 النسخ الاحتياطي يعمل تلقائياً عند التشغيل "
-        "ثم كل ساعة."
-    )
-
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            message_handler,
-        )
-    )
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+async def main():
+    asyncio.create_task(idle_message_loop())
+    log.info("Ruqayya is starting...")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     finally:
-        executor.shutdown(
-            wait=False,
-            cancel_futures=True,
-        )
+        db.close()
