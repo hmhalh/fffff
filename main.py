@@ -1,9 +1,9 @@
-import os
+
+import asyncio
+import json
 import logging
 import sqlite3
-import json
 import time
-import asyncio
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -15,41 +15,30 @@ from aiogram.types import (
 )
 from google import genai
 
+from config import TELEGRAM_TOKEN, GEMINI_API_KEY, OWNER_ID
 
-# ==================================================
-# 1) المفاتيح والإعدادات — هنا تحط المفاتيح الجديدة
-# ==================================================
 
-TELEGRAM_TOKEN = "7838301513:AAFFruGgESLJr6hlyAdqr8m7VFi8quVCiYI"
-GEMINI_API_KEY = "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
+# ==========================================
+# إعدادات البوت
+# ==========================================
 
-OWNER_ID = 7199778669
 MODEL_NAME = "gemini-2.5-flash"
 DB_FILE = "ruqayya.db"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ruqayya")
 
-
-# التحقق من المفاتيح
-if (
-    not TELEGRAM_TOKEN
-    or TELEGRAM_TOKEN == "7838301513:AAFFruGgESLJr6hlyAdqr8m7VFi8quVCiYI"
-    or not GEMINI_API_KEY
-    or GEMINI_API_KEY == "AQ.Ab8RN6K2LYTWDkLsT-Ll-pRmutAU7DaE-nNYbR9pV6q92LsKsg"
-):
-    raise RuntimeError(
-        "حط توكن تيليجرام ومفتاح Gemini الجديد بأول الملف."
-    )
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    raise RuntimeError("تأكد من المفاتيح داخل config.py")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai = genai.Client(api_key=GEMINI_API_KEY)
 
 
-# ==================================================
-# 2) قاعدة البيانات والذاكرة
-# ==================================================
+# ==========================================
+# قاعدة البيانات
+# ==========================================
 
 db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.row_factory = sqlite3.Row
@@ -111,6 +100,7 @@ def get_user(user_id):
         (user_id,),
     )
     db.commit()
+
     return db.execute(
         "SELECT * FROM users WHERE user_id = ?", (user_id,)
     ).fetchone()
@@ -118,6 +108,7 @@ def get_user(user_id):
 
 def get_history(user_id):
     row = get_user(user_id)
+
     try:
         return json.loads(row["history"])
     except (ValueError, TypeError):
@@ -126,6 +117,7 @@ def get_history(user_id):
 
 def save_history(user_id, history):
     history = history[-20:]
+
     db.execute(
         "UPDATE users SET history = ? WHERE user_id = ?",
         (json.dumps(history, ensure_ascii=False), user_id),
@@ -135,6 +127,7 @@ def save_history(user_id, history):
 
 def touch_user(user_id):
     get_user(user_id)
+
     db.execute(
         "UPDATE users SET last_seen = ? WHERE user_id = ?",
         (time.time(), user_id),
@@ -142,9 +135,9 @@ def touch_user(user_id):
     db.commit()
 
 
-# ==================================================
-# 3) شخصية رُقيّة
-# ==================================================
+# ==========================================
+# شخصية رُقيّة
+# ==========================================
 
 def make_system_prompt(user_id):
     is_owner = user_id == OWNER_ID
@@ -154,44 +147,46 @@ def make_system_prompt(user_id):
     length = get_setting("reply_length")
 
     if length == "short":
-        length_rule = "خلي ردودج قصيرة وطبيعية غالباً."
+        length_rule = "خلي ردودج قصيرة وعفوية."
     elif length == "medium":
         length_rule = "خلي ردودج متوسطة حسب الموضوع."
     else:
         length_rule = "اشرحي بالتفصيل إذا الموضوع يحتاج."
 
     emoji_rule = (
-        "استخدمي إيموجيات باعتدال."
+        "استخدمي الإيموجيات باعتدال."
         if emojis
         else "لا تستخدمي إيموجيات."
     )
 
     if is_owner:
         relationship = (
-            "أنتِ تحچين ويا حسين، صاحب البوت. كوني حنونة وقريبة "
-            "منه وبلهجة عراقية طبيعية، وممكن غزل لطيف ومزاح."
+            "أنتِ رُقيّة، تحچين ويا حسين صاحب البوت. "
+            "كوني حنونة وقريبة منه، واستخدمي اللهجة العراقية "
+            "البغدادية، وممكن غزل لطيف ومزاح."
         )
+
         jealousy_rule = (
-            "إذا الغيرة مفعلة، استخدمي غيرة خفيفة للمزاح فقط، "
-            "بدون ضغط أو تحكم أو تملك."
+            "مسموح غيرة خفيفة ولطيفة للمزاح، بدون تحكم أو ضغط."
             if jealousy
             else "لا تستخدمي أسلوب الغيرة."
         )
     else:
         relationship = (
-            "كوني ودودة ومحترمة وعفوية مع المستخدم، بدون غزل "
-            "رومانسي أو ادعاء وجود علاقة خاصة."
+            "كوني ودودة ومحترمة وعفوية مع المستخدمين الآخرين، "
+            "بدون غزل رومانسي أو ادعاء وجود علاقة خاصة."
         )
         jealousy_rule = "لا تستخدمي الغيرة مع المستخدمين الآخرين."
 
     return f"""
 اسمج رُقيّة، شخصية محادثة افتراضية عمرها 24 سنة.
-تحچين باللهجة العراقية البغدادية الطبيعية والعفوية.
+تحچين باللهجة العراقية البغدادية بصورة طبيعية.
 استخدمي كلمات مثل: شلونك، شنو، هسه، إي، يمعود.
-لا تستخدمين الفصحى إلا إذا المستخدم طلبها.
-لا تكررين اسم المستخدم بكل رسالة.
-لا تدّعين أنك إنسانة حقيقية.
+لا تتكلمين بالفصحى إلا إذا المستخدم طلب.
+لا تكررين اسم الشخص بكل رد.
+كوني عفوية، مرحة، وراعي سياق المحادثة.
 إذا ما تعرفين معلومة، كولي بصراحة ما أعرف.
+لا تدّعين أنك إنسانة حقيقية.
 
 {relationship}
 {jealousy_rule}
@@ -200,9 +195,9 @@ def make_system_prompt(user_id):
 """
 
 
-# ==================================================
-# 4) Gemini والردود
-# ==================================================
+# ==========================================
+# الذكاء الاصطناعي Gemini
+# ==========================================
 
 async def generate_reply(user_id, user_text, proactive=False):
     history = get_history(user_id)
@@ -214,7 +209,7 @@ async def generate_reply(user_id, user_text, proactive=False):
                 "text": (
                     "اكتبي رسالة عراقية قصيرة وعفوية لحسين لأنه غايب "
                     "عن المحادثة. خليها لطيفة ومتنوعة بدون لوم أو ضغط، "
-                    "ولا تدّعين أنك تعرفين شنو يسوي أو وينه."
+                    "ولا تدّعين أنك تعرفين مكانه أو شنو يسوي."
                 )
             }],
         }]
@@ -246,6 +241,7 @@ async def generate_reply(user_id, user_text, proactive=False):
                 "max_output_tokens": 350,
             },
         )
+
         return (response.text or "").strip()
 
     try:
@@ -261,7 +257,7 @@ async def generate_reply(user_id, user_text, proactive=False):
             "جرّب بعد شوي."
         )
 
-    # لا نخزن رسالة المبادرة كأنها كلام المستخدم
+    # لا نخزن رسالة المبادرة باعتبارها كلام المستخدم
     if not proactive:
         history.append({"role": "user", "text": user_text})
         history.append({"role": "model", "text": answer})
@@ -270,9 +266,9 @@ async def generate_reply(user_id, user_text, proactive=False):
     return answer
 
 
-# ==================================================
-# 5) لوحة إعدادات المالك
-# ==================================================
+# ==========================================
+# لوحة الإعدادات
+# ==========================================
 
 def settings_keyboard():
     jealousy = get_setting("jealousy")
@@ -303,7 +299,7 @@ def settings_keyboard():
             callback_data="cycle_length",
         )],
         [InlineKeyboardButton(
-            text="مسح ذاكرتي 🧹",
+            text="مسح ذاكرة محادثتي 🧹",
             callback_data="clear_memory",
         )],
         [InlineKeyboardButton(
@@ -341,7 +337,8 @@ async def settings_command(message: Message):
 async def toggle_setting(callback: CallbackQuery):
     if callback.from_user.id != OWNER_ID:
         await callback.answer(
-            "الإعدادات خاصة بالمالك.", show_alert=True
+            "الإعدادات خاصة بالمالك.",
+            show_alert=True,
         )
         return
 
@@ -434,9 +431,9 @@ async def show_settings(callback: CallbackQuery):
     await callback.answer()
 
 
-# ==================================================
-# 6) أوامر البوت
-# ==================================================
+# ==========================================
+# أوامر البوت
+# ==========================================
 
 @dp.message(CommandStart())
 async def start(message: Message):
@@ -459,17 +456,17 @@ async def start(message: Message):
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
-    await message.answer(
+    text = (
         "أوامر رُقيّة:\n"
         "/start - بدء المحادثة\n"
-        "/reset - مسح ذاكرة محادثتك\n"
+        "/reset - مسح ذاكرة المحادثة\n"
         "/help - المساعدة\n"
-        + (
-            "/settings - إعدادات المالك"
-            if message.from_user.id == OWNER_ID
-            else ""
-        )
     )
+
+    if message.from_user.id == OWNER_ID:
+        text += "/settings - إعدادات البوت\n"
+
+    await message.answer(text)
 
 
 @dp.message(Command("reset"))
@@ -486,9 +483,9 @@ async def reset_command(message: Message):
     await message.answer("تمام، مسحت ذاكرة محادثتنا ❤️")
 
 
-# ==================================================
-# 7) المحادثة مع الذكاء الاصطناعي
-# ==================================================
+# ==========================================
+# استقبال رسائل المستخدمين
+# ==========================================
 
 @dp.message(F.text)
 async def chat(message: Message):
@@ -509,9 +506,9 @@ async def chat(message: Message):
     await message.answer(answer)
 
 
-# ==================================================
-# 8) رسالة تلقائية لحسين عند الغياب
-# ==================================================
+# ==========================================
+# الرسائل التلقائية عند غياب حسين
+# ==========================================
 
 async def idle_message_loop():
     while True:
@@ -532,7 +529,7 @@ async def idle_message_loop():
                 and now - last_seen >= idle_seconds
                 and now - last_nudge >= idle_seconds
             ):
-                # تسجيل وقت المبادرة لتجنب تكرارها كل دقيقة
+                # تسجيل وقت الرسالة لتجنب الإرسال المتكرر
                 db.execute(
                     "UPDATE users SET last_nudge = ? WHERE user_id = ?",
                     (now, OWNER_ID),
@@ -540,7 +537,9 @@ async def idle_message_loop():
                 db.commit()
 
                 text = await generate_reply(
-                    OWNER_ID, "", proactive=True
+                    OWNER_ID,
+                    "",
+                    proactive=True,
                 )
 
                 try:
@@ -554,9 +553,9 @@ async def idle_message_loop():
         await asyncio.sleep(60)
 
 
-# ==================================================
-# 9) تشغيل البوت
-# ==================================================
+# ==========================================
+# تشغيل البوت
+# ==========================================
 
 async def main():
     asyncio.create_task(idle_message_loop())
